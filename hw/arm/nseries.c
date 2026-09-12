@@ -474,8 +474,10 @@ static uint32_t mipid_txrx(void *opaque, uint32_t cmd, int len)
     struct mipid_s *s = (struct mipid_s *) opaque;
     uint8_t ret;
 
-    if (len > 9) {
-        hw_error("%s: FIXME: bad SPI word width %i\n", __func__, len);
+    if (len > 10) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: unsupported SPI word width %i\n", __func__, len);
+        return 0;
     }
 
     if (s->p >= ARRAY_SIZE(s->resp)) {
