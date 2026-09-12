@@ -1332,6 +1332,12 @@ static int n810_atag_setup(const struct arm_boot_info *info, void *p)
     return n8x0_atag_setup(p, 810);
 }
 
+static void n8x0_nolo_boot_init(void *opaque)
+{
+    struct n800_s *s = opaque;
+    s->mpu->cpu->env.regs[15] = OMAP2_Q2_BASE + 0x400000;
+}
+
 static void n8x0_init(MachineState *machine,
                       struct arm_boot_info *binfo, int model)
 {
@@ -1402,6 +1408,7 @@ static void n8x0_init(MachineState *machine,
         uint8_t *nolo_tags = g_new(uint8_t, 0x10000);
         /* No, wait, better start at the ROM.  */
         s->mpu->cpu->env.regs[15] = OMAP2_Q2_BASE + 0x400000;
+        qemu_register_reset(n8x0_nolo_boot_init, s);
 
         /*
          * This is intended for loading the `secondary.bin' program from
