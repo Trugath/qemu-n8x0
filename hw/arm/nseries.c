@@ -172,7 +172,7 @@ static const uint8_t n8x0_cal_bt_id[] = {
     N8X0_BD_ADDR,
 };
 
-static void n8x0_nand_setup(struct n800_s *s)
+static void n8x0_nand_setup(struct n800_s *s, int model)
 {
     char *otp_region;
     DriveInfo *dinfo;
@@ -183,6 +183,10 @@ static void n8x0_nand_setup(struct n800_s *s)
     qdev_prop_set_uint16(s->nand, "device_id", 0x48);
     qdev_prop_set_uint16(s->nand, "version_id", 0);
     qdev_prop_set_int32(s->nand, "shift", 1);
+    if (model == 810) {
+        qdev_prop_set_uint64(s->nand, "config-trace-start", 0x00020000);
+        qdev_prop_set_uint64(s->nand, "config-trace-length", 0x00060000);
+    }
     dinfo = drive_get(IF_MTD, 0, 0);
     if (dinfo) {
         qdev_prop_set_drive_err(s->nand, "drive", blk_by_legacy_dinfo(dinfo),
@@ -1342,7 +1346,7 @@ static void n8x0_init(MachineState *machine,
      *   csr41814 (Bluetooth)
      */
     n8x0_gpio_setup(s);
-    n8x0_nand_setup(s);
+    n8x0_nand_setup(s, model);
     n8x0_i2c_setup(s);
     if (model == 800) {
         n800_tsc_kbd_setup(s);

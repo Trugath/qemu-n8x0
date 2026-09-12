@@ -33,6 +33,7 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qom/object.h"
+#include "trace.h"
 
 /* 11 for 2kB-page OneNAND ("2nd generation") and 10 for 1kB-page chips */
 #define PAGE_SHIFT 11
@@ -87,6 +88,8 @@ struct OneNANDState {
     int secs_cur;
     int blocks;
     uint8_t *blockwp;
+    uint64_t config_trace_start;
+    uint64_t config_trace_length;
 };
 
 enum {
@@ -243,21 +246,66 @@ static void onenand_system_reset(DeviceState *dev)
     onenand_reset(s, 1);
 }
 
+static void onenand_trace_config(OneNANDState *s, bool is_write,
+                                 uint64_t offset, uint32_t length,
+                                 const uint8_t *data)
+{
+    uint64_t trace_end;
+    uint64_t access_end;
+    uint64_t overlap_start;
+    uint64_t overlap_end;
+    uint64_t preview = 0;
+    uint32_t preview_length;
+    uint32_t i;
+
+    if (!s->config_trace_length) {
+        return;
+    }
+    trace_end = s->config_trace_start + s->config_trace_length;
+    access_end = offset + length;
+    overlap_start = MAX(offset, s->config_trace_start);
+    overlap_end = MIN(access_end, trace_end);
+    if (overlap_start >= overlap_end) {
+        return;
+    }
+    preview_length = MIN((uint64_t)8, overlap_end - overlap_start);
+    data += overlap_start - offset;
+    for (i = 0; i < preview_length; i++) {
+        preview |= (uint64_t)data[i] << (i * 8);
+    }
+    if (is_write) {
+        trace_rx44_config_write(overlap_start,
+                                overlap_start - s->config_trace_start,
+                                overlap_end - overlap_start, preview,
+                                preview_length);
+    } else {
+        trace_rx44_config_read(overlap_start,
+                               overlap_start - s->config_trace_start,
+                               overlap_end - overlap_start, preview,
+                               preview_length);
+    }
+}
+
 static inline int onenand_load_main(OneNANDState *s, int sec, int secn,
                 void *dest)
 {
+    uint64_t offset = (uint64_t)sec << BDRV_SECTOR_BITS;
+    uint32_t length = secn << BDRV_SECTOR_BITS;
+    int result = 0;
+
     assert(UINT32_MAX >> BDRV_SECTOR_BITS > sec);
     assert(UINT32_MAX >> BDRV_SECTOR_BITS > secn);
     if (s->blk_cur) {
-        return blk_pread(s->blk_cur, sec << BDRV_SECTOR_BITS,
-                         secn << BDRV_SECTOR_BITS, dest, 0) < 0;
+        result = blk_pread(s->blk_cur, offset, length, dest, 0) < 0;
     } else if (sec + secn > s->secs_cur) {
         return 1;
+    } else {
+        memcpy(dest, s->current + offset, length);
     }
-
-    memcpy(dest, s->current + (sec << 9), secn << 9);
-
-    return 0;
+    if (!result) {
+        onenand_trace_config(s, false, offset, length, dest);
+    }
+    return result;
 }
 
 static inline int onenand_prog_main(OneNANDState *s, int sec, int secn,
@@ -292,6 +340,9 @@ static inline int onenand_prog_main(OneNANDState *s, int sec, int secn,
             if (s->blk_cur) {
                 result = blk_pwrite(s->blk_cur, offset, size, dp, 0) < 0;
             }
+        }
+        if (!result) {
+            onenand_trace_config(s, true, offset, size, dp);
         }
         if (dp && s->blk_cur) {
             g_free(dp);
@@ -838,6 +889,10 @@ static Property onenand_properties[] = {
     DEFINE_PROP_UINT16("version_id", OneNANDState, id.ver, 0),
     DEFINE_PROP_INT32("shift", OneNANDState, shift, 0),
     DEFINE_PROP_DRIVE("drive", OneNANDState, blk),
+    DEFINE_PROP_UINT64("config-trace-start", OneNANDState,
+                       config_trace_start, 0),
+    DEFINE_PROP_UINT64("config-trace-length", OneNANDState,
+                       config_trace_length, 0),
     DEFINE_PROP_END_OF_LIST(),
 };
 
