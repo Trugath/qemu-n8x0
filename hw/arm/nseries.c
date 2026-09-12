@@ -1367,6 +1367,10 @@ static void n8x0_init(MachineState *machine,
                                 machine->ram);
 
     s->mpu = omap2420_mpu_init(machine->ram, machine->cpu_type);
+    if (model == 810) {
+        omap_clk_setbase(omap_findclk(s->mpu, "ref_clk"), 19200000);
+        omap_clk_setbase(omap_findclk(s->mpu, "sys_clk"), 19200000);
+    }
 
     /* Setup peripherals
      *

@@ -1369,6 +1369,40 @@ static void omap_prcm_dpll_update(struct omap_prcm_s *s)
     }
 }
 
+static void omap_prcm_core_gptimer_update(struct omap_prcm_s *s)
+{
+    static const char *const names[] = {
+        "core_gpt2_clk", "core_gpt3_clk", "core_gpt4_clk",
+        "core_gpt5_clk", "core_gpt6_clk", "core_gpt7_clk",
+        "core_gpt8_clk", "core_gpt9_clk", "core_gpt10_clk",
+        "core_gpt11_clk", "core_gpt12_clk",
+    };
+    omap_clk clk32 = omap_findclk(s->mpu, "clk32-kHz");
+    omap_clk sys = omap_findclk(s->mpu, "sys_clk");
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(names); i++) {
+        unsigned int source = (s->clksel[2] >> (2 + i * 2)) & 3;
+
+        if (source == 0) {
+            omap_clk_reparent(omap_findclk(s->mpu, names[i]), clk32);
+        } else if (source == 1) {
+            omap_clk_reparent(omap_findclk(s->mpu, names[i]), sys);
+        }
+    }
+}
+
+static void omap_prcm_wkup_gptimer_update(struct omap_prcm_s *s)
+{
+    omap_clk timer = omap_findclk(s->mpu, "wu_gpt1_clk");
+
+    if (s->clksel[4] == 0) {
+        omap_clk_reparent(timer, omap_findclk(s->mpu, "clk32-kHz"));
+    } else if (s->clksel[4] == 1) {
+        omap_clk_reparent(timer, omap_findclk(s->mpu, "sys_clk"));
+    }
+}
+
 static void omap_prcm_write(void *opaque, hwaddr addr,
                             uint64_t value, unsigned size)
 {
@@ -1543,7 +1577,7 @@ static void omap_prcm_write(void *opaque, hwaddr addr,
 
     case 0x244:	/* CM_CLKSEL2_CORE */
         s->clksel[2] = value & 0x00fffffc;
-        /* TODO update clocks */
+        omap_prcm_core_gptimer_update(s);
         break;
 
     case 0x248:	/* CM_CLKSTCTRL_CORE */
@@ -1611,7 +1645,7 @@ static void omap_prcm_write(void *opaque, hwaddr addr,
         break;
     case 0x440:	/* CM_CLKSEL_WKUP */
         s->clksel[4] = value & 3;
-        /* TODO update clocks */
+        omap_prcm_wkup_gptimer_update(s);
         break;
     case 0x450:	/* RM_RSTCTRL_WKUP */
         /* TODO: reset */
@@ -1788,8 +1822,10 @@ static void omap_prcm_reset(struct omap_prcm_s *s)
     s->clksel[0] = 0x01;
     s->clksel[1] = 0x02100121;
     s->clksel[2] = 0x00000000;
+    omap_prcm_core_gptimer_update(s);
     s->clksel[3] = 0x01;
     s->clksel[4] = 0;
+    omap_prcm_wkup_gptimer_update(s);
     s->clksel[7] = 0x0121;
     s->wkup[0] = 0x15;
     s->wkup[1] = 0x13;

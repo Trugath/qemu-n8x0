@@ -64,6 +64,7 @@ void omap_clk_get(omap_clk clk);
 void omap_clk_put(omap_clk clk);
 void omap_clk_onoff(omap_clk clk, int on);
 void omap_clk_canidle(omap_clk clk, int can);
+void omap_clk_setbase(omap_clk clk, unsigned long rate);
 void omap_clk_setrate(omap_clk clk, int divide, int multiply);
 int64_t omap_clk_getrate(omap_clk clk);
 void omap_clk_reparent(omap_clk clk, omap_clk parent);

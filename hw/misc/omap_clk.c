@@ -535,7 +535,7 @@ static struct clk apll_54m = {
 static struct clk sys_clk = {
     .name	= "sys_clk",
     .flags	= CLOCK_IN_OMAP242X | CLOCK_IN_OMAP243X | ALWAYS_ENABLED,
-    .rate	= 32768,
+    .rate	= 12000000,
     /*.parent	= sys.xtalin */
 };
 
@@ -1206,6 +1206,12 @@ void omap_clk_canidle(struct clk *clk, int can)
         omap_clk_put(clk);
     else
         omap_clk_get(clk);
+}
+
+void omap_clk_setbase(struct clk *clk, unsigned long rate)
+{
+    g_assert(clk->parent == NULL);
+    omap_clk_rate_update_full(clk, rate, 1, 1);
 }
 
 void omap_clk_setrate(struct clk *clk, int divide, int multiply)

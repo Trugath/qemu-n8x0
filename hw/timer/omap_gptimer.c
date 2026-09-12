@@ -401,6 +401,7 @@ static void omap_gp_timer_write(void *opaque, hwaddr addr, uint32_t value)
 
     case 0x24:	/* TCLR */
         omap_gp_timer_sync(s);
+        s->rate = omap_clk_getrate(s->clk);
         s->inout = (value >> 14) & 1;
         s->capt2 = (value >> 13) & 1;
         s->pt = (value >> 12) & 1;
