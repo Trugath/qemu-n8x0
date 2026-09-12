@@ -1335,6 +1335,7 @@ static int n810_atag_setup(const struct arm_boot_info *info, void *p)
 static void n8x0_nolo_boot_init(void *opaque)
 {
     struct n800_s *s = opaque;
+    n8x0_boot_init(s);
     s->mpu->cpu->env.regs[15] = OMAP2_Q2_BASE + 0x400000;
 }
 
