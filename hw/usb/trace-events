@@ -1,5 +1,10 @@
 # See docs/devel/tracing.rst for syntax documentation.
 
+# tusb6010.c
+tusb6010_read(void *s, uint64_t offset, unsigned size, uint64_t value) "tusb=%p offset=0x%03" PRIx64 " size=%u value=0x%" PRIx64
+tusb6010_write(void *s, uint64_t offset, unsigned size, uint64_t value) "tusb=%p offset=0x%03" PRIx64 " size=%u value=0x%" PRIx64
+tusb6010_power(void *s, int requested, int previous) "tusb=%p requested=%d previous=%d"
+
 # core.c
 usb_packet_state_change(int bus, const char *port, int ep, void *p, const char *o, const char *n) "bus %d, port %s, ep %d, packet %p, state %s -> %s"
 usb_packet_state_fault(int bus, const char *port, int ep, void *p, const char *o, const char *n) "bus %d, port %s, ep %d, packet %p, state %s, expected %s"

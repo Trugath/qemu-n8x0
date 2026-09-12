@@ -27,6 +27,7 @@
 #include "hw/arm/omap.h"
 #include "hw/hw.h"
 #include "hw/irq.h"
+#include "trace.h"
 #include "hw/sysbus.h"
 #include "qom/object.h"
 
@@ -646,21 +647,29 @@ static void tusb_async_writew(void *opaque, hwaddr addr,
 
 static uint64_t tusb_async_readfn(void *opaque, hwaddr addr, unsigned size)
 {
+    uint64_t value;
+
     switch (size) {
     case 1:
-        return tusb_async_readb(opaque, addr);
+        value = tusb_async_readb(opaque, addr);
+        break;
     case 2:
-        return tusb_async_readh(opaque, addr);
+        value = tusb_async_readh(opaque, addr);
+        break;
     case 4:
-        return tusb_async_readw(opaque, addr);
+        value = tusb_async_readw(opaque, addr);
+        break;
     default:
         g_assert_not_reached();
     }
+    trace_tusb6010_read(opaque, addr & 0xfff, size, value);
+    return value;
 }
 
 static void tusb_async_writefn(void *opaque, hwaddr addr,
                                uint64_t value, unsigned size)
 {
+    trace_tusb6010_write(opaque, addr & 0xfff, size, value);
     switch (size) {
     case 1:
         tusb_async_writeb(opaque, addr, value);
@@ -754,6 +763,7 @@ static void tusb_musb_core_intr(void *opaque, int source, int level)
 
 static void tusb6010_power(TUSBState *s, int on)
 {
+    trace_tusb6010_power(s, on, s->power);
     if (!on) {
         s->power = 0;
     } else if (!s->power && on) {
