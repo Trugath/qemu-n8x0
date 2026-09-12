@@ -48,6 +48,11 @@ hid_kbd_queue_empty(void) "queue empty"
 
 # tsc2005.c
 tsc2005_sense(const char *state) "touchscreen sense %s"
+tsc2005_command(uint8_t command, int function, bool precision, bool enabled) "command=0x%02x function=%d precision12=%d enabled=%d"
+tsc2005_register(int reg, bool write, uint16_t value) "reg=0x%x write=%d value=0x%04x"
+tsc2005_sample(int x, int y, int z1, int z2, bool pressed) "x=%d y=%d z1=%d z2=%d pressed=%d"
+tsc2005_pen(int x, int y, bool pressed) "host-x=%d host-y=%d pressed=%d"
+tsc2005_irq(int level, uint16_t dav) "level=%d dav=0x%04x"
 
 # lm832x.c
 lm8323_command(uint8_t command, bool write) "command=0x%02x write=%d"

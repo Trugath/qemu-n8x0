@@ -25,6 +25,7 @@
 #include "hw/hw.h"
 #include "hw/irq.h"
 #include "hw/arm/omap.h"
+#include "trace.h"
 
 /* Multichannel SPI */
 struct omap_mcspi_s {
@@ -56,7 +57,10 @@ struct omap_mcspi_s {
 
 static inline void omap_mcspi_interrupt_update(struct omap_mcspi_s *s)
 {
-    qemu_set_irq(s->irq, s->irqst & s->irqen);
+    int level = !!(s->irqst & s->irqen);
+
+    trace_omap_mcspi_irq(s, s->irqst, s->irqen, level);
+    qemu_set_irq(s->irq, level);
 }
 
 static inline void omap_mcspi_dmarequest_update(struct omap_mcspi_ch_s *ch)
@@ -89,9 +93,13 @@ static void omap_mcspi_transfer_run(struct omap_mcspi_s *s, int chnum)
 
     if (!(s->control & 1) ||				/* SINGLE */
                     (ch->config & (1 << 20))) {		/* FORCE */
-        if (ch->txrx)
+        if (ch->txrx) {
             ch->rx = ch->txrx(ch->opaque, ch->tx,	/* WL */
                             1 + (0x1f & (ch->config >> 7)));
+            trace_omap_mcspi_transfer(s, chnum,
+                                      1 + (0x1f & (ch->config >> 7)),
+                                      ch->tx, ch->rx);
+        }
     }
 
     ch->tx = 0;
@@ -317,9 +325,12 @@ static void omap_mcspi_write(void *opaque, hwaddr addr,
     case 0x34:	/* MCSPI_CHCTRL */
         if (value & ~s->ch[ch].control & 1) {		/* EN */
             s->ch[ch].control |= 1;
+            trace_omap_mcspi_cs(s, ch, true);
             omap_mcspi_transfer_run(s, ch);
-        } else
+        } else {
             s->ch[ch].control = value & 1;
+            trace_omap_mcspi_cs(s, ch, s->ch[ch].control & 1);
+        }
         break;
 
     case 0x74: ch ++;

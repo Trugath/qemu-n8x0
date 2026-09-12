@@ -26,6 +26,11 @@ npcm_pspi_enter_reset(const char *id, int reset_type) "%s reset type: %d"
 npcm_pspi_ctrl_read(const char *id, uint64_t addr, uint16_t data) "%s offset: 0x%03" PRIx64 " value: 0x%04" PRIx16
 npcm_pspi_ctrl_write(const char *id, uint64_t addr, uint16_t data) "%s offset: 0x%03" PRIx64 " value: 0x%04" PRIx16
 
+# omap_spi.c
+omap_mcspi_irq(void *controller, uint32_t status, uint32_t enable, int level) "%p status=0x%08x enable=0x%08x level=%d"
+omap_mcspi_cs(void *controller, int channel, bool enabled) "%p channel=%d enabled=%d"
+omap_mcspi_transfer(void *controller, int channel, int bits, uint32_t tx, uint32_t rx) "%p channel=%d bits=%d tx=0x%08x rx=0x%08x"
+
 # ibex_spi_host.c
 
 ibex_spi_host_reset(const char *msg) "%s"

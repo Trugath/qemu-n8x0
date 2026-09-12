@@ -253,6 +253,7 @@ static void tsc2005_pin_update(TSC2005State *s)
 
     if (pin_state != s->irq) {
         s->irq = pin_state;
+        trace_tsc2005_irq(s->irq, s->dav);
         qemu_set_irq(s->pint, s->irq);
     }
 
@@ -357,6 +358,8 @@ static uint8_t tsc2005_txrx_word(void *opaque, uint8_t value)
                 tsc2005_pin_update(s);
             }
 
+            trace_tsc2005_command(value, s->nextfunction,
+                                  s->nextprecision, s->enabled);
             s->state = 0;
         } else if (value) {
             /* Data transfer */
@@ -367,6 +370,7 @@ static uint8_t tsc2005_txrx_word(void *opaque, uint8_t value)
             if (s->command) {
                 /* Read */
                 s->data = tsc2005_read(s, s->reg);
+                trace_tsc2005_register(s->reg, false, s->data);
                 tsc2005_pin_update(s);
             } else
                 s->data = 0;
@@ -388,6 +392,7 @@ static uint8_t tsc2005_txrx_word(void *opaque, uint8_t value)
         else {
             s->data |= value;
             tsc2005_write(s, s->reg, s->data);
+            trace_tsc2005_register(s->reg, true, s->data);
             tsc2005_pin_update(s);
         }
 
@@ -427,6 +432,11 @@ static void tsc2005_timer_tick(void *opaque)
     s->busy = false;
     s->dav |= mode_regs[function];
     s->function = -1;
+    trace_tsc2005_sample(
+        TSC_CUT_RESOLUTION(X_TRANSFORM(s), s->precision),
+        TSC_CUT_RESOLUTION(Y_TRANSFORM(s), s->precision),
+        TSC_CUT_RESOLUTION(Z1_TRANSFORM(s), s->precision),
+        TSC_CUT_RESOLUTION(Z2_TRANSFORM(s), s->precision), s->pressure);
     tsc2005_pin_update(s);
 }
 
@@ -441,6 +451,7 @@ static void tsc2005_touchscreen_event(void *opaque,
         s->y = y;
     }
     s->pressure = !!buttons_state;
+    trace_tsc2005_pen(s->x, s->y, s->pressure);
 
     /*
      * Note: We would get better responsiveness in the guest by
