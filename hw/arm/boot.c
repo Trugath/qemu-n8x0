@@ -290,11 +290,16 @@ static void set_kernel_args(const struct arm_boot_info *info, AddressSpace *as)
     WRITE_WORD(p, 0x1000);
     WRITE_WORD(p, 0);
     /* ATAG_MEM */
-    /* TODO: handle multiple chips on one ATAG list */
     WRITE_WORD(p, 4);
     WRITE_WORD(p, 0x54410002);
     WRITE_WORD(p, info->ram_size);
     WRITE_WORD(p, info->loader_start);
+    if (info->ram_size2) {
+        WRITE_WORD(p, 4);
+        WRITE_WORD(p, 0x54410002);
+        WRITE_WORD(p, info->ram_size2);
+        WRITE_WORD(p, info->loader_start2);
+    }
     if (initrd_size) {
         /* ATAG_INITRD2 */
         WRITE_WORD(p, 4);

@@ -51,6 +51,8 @@
 /* Nokia N8x0 support */
 struct n800_s {
     struct omap_mpu_state_s *mpu;
+    MemoryRegion sdram_cs0;
+    MemoryRegion sdram_cs1;
 
     struct rfbi_chip_s blizzard;
     struct {
@@ -866,8 +868,8 @@ static void n8x0_setup_nolo_tags(void *sram_base, int model)
     if (model == 810) {
         strcpy((void *) (p + 0), "Nokia N810");
         strcpy((void *) (p + 8), "F4");
-        stl_p(p + 10, 0x060c0000);
-        strcpy((void *) (p + 9), "RX-44");
+        strcpy((void *) (p + 10), "RX-44");
+        stw_p((uint16_t *) p + 23, 0x060c);
     } else {
         strcpy((void *) (p + 0), "QEMU N800");
         strcpy((void *) (p + 8), "F5");
@@ -1086,6 +1088,12 @@ static void n8x0_boot_init(void *opaque)
     omap_writel(0x48008540,			/* CM_CLKSEL1_PLL */
                     (0x78 << 12) | (6 << 8));
     omap_writel(0x48008544, 2);			/* CM_CLKSEL2_PLL */
+
+    /*
+     * Official N8x0 X-Loader maps the second 64 MiB SDRAM chip using
+     * SDRC_CS_CFG before entering secondary.
+     */
+    omap_writel(0x68009040, 0x00000001);	/* SDRC_CS_CFG */
 
     /* GPMC setup */
     n800_gpmc_init(s);
@@ -1361,12 +1369,23 @@ static void n8x0_init(MachineState *machine,
         g_free(sz);
         exit(EXIT_FAILURE);
     }
-    binfo->ram_size = machine->ram_size;
+    binfo->ram_size = machine->ram_size / 2;
+    binfo->ram_size2 = machine->ram_size / 2;
+    binfo->loader_start2 = OMAP2_Q2_BASE + 0x08000000;
 
+    memory_region_init_alias(&s->sdram_cs0, OBJECT(machine),
+                             "omap2.dram.cs0", machine->ram, 0,
+                             machine->ram_size / 2);
+    memory_region_init_alias(&s->sdram_cs1, OBJECT(machine),
+                             "omap2.dram.cs1", machine->ram,
+                             machine->ram_size / 2, machine->ram_size / 2);
     memory_region_add_subregion(get_system_memory(), OMAP2_Q2_BASE,
-                                machine->ram);
+                                &s->sdram_cs0);
+    memory_region_add_subregion(get_system_memory(), binfo->loader_start2,
+                                &s->sdram_cs1);
 
-    s->mpu = omap2420_mpu_init(machine->ram, machine->cpu_type);
+    s->mpu = omap2420_mpu_init(&s->sdram_cs0, &s->sdram_cs1,
+                               machine->cpu_type);
     if (model == 810) {
         omap_clk_setbase(omap_findclk(s->mpu, "ref_clk"), 19200000);
         omap_clk_setbase(omap_findclk(s->mpu, "sys_clk"), 19200000);

@@ -2331,8 +2331,8 @@ static const struct dma_irq_map omap2_dma_irq_map[] = {
     { 0, OMAP_INT_24XX_SDMA_IRQ3 },
 };
 
-struct omap_mpu_state_s *omap2420_mpu_init(MemoryRegion *sdram,
-                const char *cpu_type)
+struct omap_mpu_state_s *omap2420_mpu_init(MemoryRegion *sdram_cs0,
+                MemoryRegion *sdram_cs1, const char *cpu_type)
 {
     struct omap_mpu_state_s *s = g_new0(struct omap_mpu_state_s, 1);
     qemu_irq dma_irqs[4];
@@ -2389,8 +2389,11 @@ struct omap_mpu_state_s *omap2420_mpu_init(MemoryRegion *sdram,
     s->port->addr_valid = omap2_validate_addr;
 
     /* Register SDRAM and SRAM ports for fast DMA transfers.  */
-    soc_dma_port_add_mem(s->dma, memory_region_get_ram_ptr(sdram),
-                         OMAP2_Q2_BASE, memory_region_size(sdram));
+    soc_dma_port_add_mem(s->dma, memory_region_get_ram_ptr(sdram_cs0),
+                         OMAP2_Q2_BASE, memory_region_size(sdram_cs0));
+    soc_dma_port_add_mem(s->dma, memory_region_get_ram_ptr(sdram_cs1),
+                         OMAP2_Q2_BASE + 0x08000000,
+                         memory_region_size(sdram_cs1));
     soc_dma_port_add_mem(s->dma, memory_region_get_ram_ptr(&s->sram),
                          OMAP2_SRAM_BASE, s->sram_size);
 

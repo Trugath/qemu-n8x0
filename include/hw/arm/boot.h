@@ -39,11 +39,13 @@ void armv7m_load_kernel(ARMCPU *cpu, const char *kernel_filename,
 /* arm_boot.c */
 struct arm_boot_info {
     uint64_t ram_size;
+    uint64_t ram_size2;
     const char *kernel_filename;
     const char *kernel_cmdline;
     const char *initrd_filename;
     const char *dtb_filename;
     hwaddr loader_start;
+    hwaddr loader_start2;
     hwaddr dtb_start;
     hwaddr dtb_limit;
     /* If set to True, arm_load_kernel() will not load DTB.

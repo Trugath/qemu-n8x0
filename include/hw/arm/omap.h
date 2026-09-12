@@ -985,8 +985,8 @@ struct omap_mpu_state_s *omap310_mpu_init(MemoryRegion *sdram,
                 const char *core);
 
 /* omap2.c */
-struct omap_mpu_state_s *omap2420_mpu_init(MemoryRegion *sdram,
-                const char *core);
+struct omap_mpu_state_s *omap2420_mpu_init(MemoryRegion *sdram_cs0,
+                MemoryRegion *sdram_cs1, const char *core);
 
 uint32_t omap_badwidth_read8(void *opaque, hwaddr addr);
 void omap_badwidth_write8(void *opaque, hwaddr addr,

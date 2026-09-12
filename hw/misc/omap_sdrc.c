@@ -24,11 +24,13 @@
 struct omap_sdrc_s {
     MemoryRegion iomem;
     uint8_t config;
+    uint32_t cs_cfg;
 };
 
 void omap_sdrc_reset(struct omap_sdrc_s *s)
 {
     s->config = 0x10;
+    s->cs_cfg = 0;
 }
 
 static uint64_t omap_sdrc_read(void *opaque, hwaddr addr, unsigned size)
@@ -50,6 +52,8 @@ static uint64_t omap_sdrc_read(void *opaque, hwaddr addr, unsigned size)
         return 1;						/* RESETDONE */
 
     case 0x40:	/* SDRC_CS_CFG */
+        return s->cs_cfg;
+
     case 0x44:	/* SDRC_SHARING */
     case 0x48:	/* SDRC_ERR_ADDR */
     case 0x4c:	/* SDRC_ERR_TYPE */
@@ -114,6 +118,9 @@ static void omap_sdrc_write(void *opaque, hwaddr addr,
         break;
 
     case 0x40:	/* SDRC_CS_CFG */
+        s->cs_cfg = value & 0x30f;
+        break;
+
     case 0x44:	/* SDRC_SHARING */
     case 0x4c:	/* SDRC_ERR_TYPE */
     case 0x60:	/* SDRC_DLLA_SCTRL */
