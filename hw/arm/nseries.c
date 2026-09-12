@@ -845,7 +845,7 @@ static const uint32_t n800_pinout[104] = {
     0x01200000, 0x0f0b1b1b, 0x0f0200e8, 0x0000020b,
 };
 
-static void n800_setup_nolo_tags(void *sram_base)
+static void n8x0_setup_nolo_tags(void *sram_base, int model)
 {
     int i;
     uint32_t *p = sram_base + 0x8000;
@@ -853,12 +853,17 @@ static void n800_setup_nolo_tags(void *sram_base)
 
     memset(p, 0, 0x3000);
 
-    strcpy((void *) (p + 0), "QEMU N800");
-
-    strcpy((void *) (p + 8), "F5");
-
-    stl_p(p + 10, 0x04f70000);
-    strcpy((void *) (p + 9), "RX-34");
+    if (model == 810) {
+        strcpy((void *) (p + 0), "Nokia N810");
+        strcpy((void *) (p + 8), "F4");
+        stl_p(p + 10, 0x060c0000);
+        strcpy((void *) (p + 9), "RX-44");
+    } else {
+        strcpy((void *) (p + 0), "QEMU N800");
+        strcpy((void *) (p + 8), "F5");
+        stl_p(p + 10, 0x04f70000);
+        strcpy((void *) (p + 9), "RX-34");
+    }
 
     /* RAM size in MB? */
     stl_p(p + 12, 0x80);
@@ -885,16 +890,16 @@ static void n800_setup_nolo_tags(void *sram_base)
 
     /* NOLO serial console */
     ADD_TAG(0x6e02, 4);
-    stl_p(v++, XLDR_LL_UART);		/* UART number (1 - 3) */
+    stl_p(v++, model == 810 ? 3 : XLDR_LL_UART);
 
-#if 0
-    /* CBUS settings (Retu/AVilma) */
-    ADD_TAG(0x6e03, 6);
-    stw_p((uint16_t *) v + 0, 65);	/* CBUS GPIO0 */
-    stw_p((uint16_t *) v + 1, 66);	/* CBUS GPIO1 */
-    stw_p((uint16_t *) v + 2, 64);	/* CBUS GPIO2 */
-    v += 2;
-#endif
+    if (model == 810) {
+        /* CBUS clock, data and select GPIOs */
+        ADD_TAG(0x6e03, 6);
+        stw_p((uint16_t *) v + 0, N8X0_CBUS_CLK_GPIO);
+        stw_p((uint16_t *) v + 1, N8X0_CBUS_DAT_GPIO);
+        stw_p((uint16_t *) v + 2, N8X0_CBUS_SEL_GPIO);
+        v += 2;
+    }
 
     /* Nokia ASIC BB5 (Retu/Tahvo) */
     ADD_TAG(0x6e0a, 4);
@@ -908,11 +913,11 @@ static void n800_setup_nolo_tags(void *sram_base)
     stw_p((uint16_t *) v + 1, 24);	/* ??? */
     v++;
 
-#if 0
-    /* LCD settings */
-    ADD_TAG(0x6e06, 2);
-    stw_p((uint16_t *) (v++), 15);	/* ??? */
-#endif
+    if (model == 810) {
+        /* RX-44 LCD settings */
+        ADD_TAG(0x6e06, 2);
+        stw_p((uint16_t *) (v++), 15);
+    }
 
     /* I^2C (Menelaus) */
     ADD_TAG(0x6e07, 4);
@@ -926,23 +931,38 @@ static void n800_setup_nolo_tags(void *sram_base)
     v += 2;
 
     /* OMAP gpio switch info */
-    ADD_TAG(0x6e0c, 80);
-    strcpy((void *) v, "bat_cover");	v += 3;
-    stw_p((uint16_t *) v + 0, 110);	/* GPIO num ??? */
-    stw_p((uint16_t *) v + 1, 1);	/* GPIO num ??? */
-    v += 2;
-    strcpy((void *) v, "cam_act");	v += 3;
-    stw_p((uint16_t *) v + 0, 95);	/* GPIO num ??? */
-    stw_p((uint16_t *) v + 1, 32);	/* GPIO num ??? */
-    v += 2;
-    strcpy((void *) v, "cam_turn");	v += 3;
-    stw_p((uint16_t *) v + 0, 12);	/* GPIO num ??? */
-    stw_p((uint16_t *) v + 1, 33);	/* GPIO num ??? */
-    v += 2;
-    strcpy((void *) v, "headphone");	v += 3;
-    stw_p((uint16_t *) v + 0, 107);	/* GPIO num ??? */
-    stw_p((uint16_t *) v + 1, 17);	/* GPIO num ??? */
-    v += 2;
+#define ADD_GPIO_SWITCH(name, gpio, type) do { \
+        strcpy((void *) v, name); v += 3; \
+        stw_p((uint16_t *) v + 0, gpio); \
+        stw_p((uint16_t *) v + 1, type); v += 2; \
+    } while (0)
+    if (model == 810) {
+        ADD_TAG(0x6e0c, 120);
+        ADD_GPIO_SWITCH("gps_reset", N810_GPS_RESET_GPIO,
+                        OMAP_GPIOSW_TYPE_ACTIVITY | OMAP_GPIOSW_OUTPUT);
+        ADD_GPIO_SWITCH("gps_wakeup", N810_GPS_WAKEUP_GPIO,
+                        OMAP_GPIOSW_TYPE_ACTIVITY | OMAP_GPIOSW_OUTPUT);
+        ADD_GPIO_SWITCH("headphone", N8X0_HEADPHONE_GPIO,
+                        OMAP_GPIOSW_TYPE_CONNECTION | OMAP_GPIOSW_INVERTED);
+        ADD_GPIO_SWITCH("kb_lock", N810_KB_LOCK_GPIO,
+                        OMAP_GPIOSW_TYPE_COVER | OMAP_GPIOSW_INVERTED);
+        ADD_GPIO_SWITCH("sleepx_led", N810_SLEEPX_LED_GPIO,
+                        OMAP_GPIOSW_TYPE_ACTIVITY |
+                        OMAP_GPIOSW_INVERTED | OMAP_GPIOSW_OUTPUT);
+        ADD_GPIO_SWITCH("slide", N810_SLIDE_GPIO,
+                        OMAP_GPIOSW_TYPE_COVER | OMAP_GPIOSW_INVERTED);
+    } else {
+        ADD_TAG(0x6e0c, 80);
+        ADD_GPIO_SWITCH("bat_cover", N800_BAT_COVER_GPIO,
+                        OMAP_GPIOSW_TYPE_COVER | OMAP_GPIOSW_INVERTED);
+        ADD_GPIO_SWITCH("cam_act", N800_CAM_ACT_GPIO,
+                        OMAP_GPIOSW_TYPE_ACTIVITY);
+        ADD_GPIO_SWITCH("cam_turn", N800_CAM_TURN_GPIO,
+                        OMAP_GPIOSW_TYPE_ACTIVITY | OMAP_GPIOSW_INVERTED);
+        ADD_GPIO_SWITCH("headphone", N8X0_HEADPHONE_GPIO,
+                        OMAP_GPIOSW_TYPE_CONNECTION | OMAP_GPIOSW_INVERTED);
+    }
+#undef ADD_GPIO_SWITCH
 
     /* Bluetooth */
     ADD_TAG(0x6e0e, 12);
@@ -970,6 +990,17 @@ static void n800_setup_nolo_tags(void *sram_base)
     /* TEA5761 sensor settings */
     ADD_TAG(0x6e12, 2);
     stl_p(v++, 93);			/* GPIO num ??? */
+
+    if (model == 810) {
+        /* RX-44 touchscreen/keyboard board data */
+        ADD_TAG(0x6e14, 6);
+        stw_p((uint16_t *) v + 0, 1);
+        stw_p((uint16_t *) v + 1, N810_KEYBOARD_GPIO);
+        stw_p((uint16_t *) v + 2, N810_TSC_RESET_GPIO);
+        v += 2;
+        ADD_TAG(0x6e15, 1);
+        stl_p(v++, 2);
+    }
 
 #if 0
     /* Unknown tag */
@@ -1391,7 +1422,7 @@ static void n8x0_init(MachineState *machine,
             exit(EXIT_FAILURE);
         }
 
-        n800_setup_nolo_tags(nolo_tags);
+        n8x0_setup_nolo_tags(nolo_tags, model);
         cpu_physical_memory_write(OMAP2_SRAM_BASE, nolo_tags, 0x10000);
         g_free(nolo_tags);
     }
