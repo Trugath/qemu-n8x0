@@ -513,11 +513,19 @@ static uint32_t mipid_txrx(void *opaque, uint32_t cmd, int len)
         s->resp[2] = (s->id >>  0) & 0xff;
         break;
 
+    case 0x08:	/* RD_BLUE, used as RDDID by RX-44 NOLO */
+        s->p = 0;
+        if (len == 10) {
+            s->resp[0] = (s->id >> 16) & 0xff;
+            s->resp[1] = (s->id >>  8) & 0xff;
+            s->resp[2] = (s->id >>  0) & 0xff;
+        } else {
+            s->resp[0] = 0x01;
+        }
+        break;
+
     case 0x06:	/* RD_RED */
     case 0x07:	/* RD_GREEN */
-        /* XXX the bootloader sometimes issues RD_BLUE meaning RDDID so
-         * for the bootloader one needs to change this.  */
-    case 0x08:	/* RD_BLUE */
         s->p = 0;
         /* TODO: return first pixel components */
         s->resp[0] = 0x01;
