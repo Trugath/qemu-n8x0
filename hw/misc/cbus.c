@@ -207,6 +207,8 @@ static void retu_interrupt_update(CBusRetu *s)
 #define RETU_REG_SGR2		0x1e	/* (RW) */
 #define RETU_REG_SCR2		0x1f	/* (RW) */
 
+#define RETU_STATUS_BATAVAIL	0x0100	/* Battery available */
+
 /* Retu Interrupt sources */
 enum {
     retu_int_pwr	= 0,	/* Power button */
@@ -393,7 +395,7 @@ void *retu_init(qemu_irq irq, int vilma)
     s->irq = irq;
     s->irqen = 0xffff;
     s->irqst = 0x0000;
-    s->status = 0x0020;
+    s->status = 0x0020 | RETU_STATUS_BATAVAIL;
     s->is_vilma = !!vilma;
     s->rtc.cal = 0x01;
     s->result[retu_adc_bsi] = 0x3c2;
