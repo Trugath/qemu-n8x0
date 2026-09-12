@@ -12,8 +12,15 @@
 #include "cpu-features.h"
 #include "cpregs.h"
 #include "exec/exec-all.h"
+#include "exec/tb-flush.h"
 #include "exec/helper-proto.h"
 #include "sysemu/tcg.h"
+#ifndef CONFIG_USER_ONLY
+#include "qemu/timer.h"
+#include "qemu/user-trace-pc.h"
+#include "exec/cpu-common.h"
+#include "hw/boards.h"
+#endif
 
 #ifdef CONFIG_TCG
 /* Return the Exception Level targeted by debug exceptions. */
@@ -1278,3 +1285,366 @@ void define_debug_regs(ARMCPU *cpu)
         g_free(dbgwcr_el1_name);
     }
 }
+
+#if defined(CONFIG_TCG) && !defined(CONFIG_USER_ONLY)
+static uint32_t user_trace_phys_ldl(hwaddr addr)
+{
+    uint32_t value = 0;
+
+    cpu_physical_memory_read(addr, &value, sizeof(value));
+    return le32_to_cpu(value);
+}
+
+static void user_trace_append_string(CPUState *cs, GString *msg,
+                                     uint32_t addr, const char *tag)
+{
+    uint8_t buf[64];
+    unsigned n;
+    unsigned hex;
+
+    if (addr < 0x1000) {
+        return;
+    }
+    g_string_append_printf(msg, " %shex=", tag);
+    for (hex = 0; hex < 16; hex++) {
+        if (cpu_memory_rw_debug(cs, addr + hex, &buf[hex], 1, false) != 0) {
+            g_string_append(msg, "??");
+            return;
+        }
+        g_string_append_printf(msg, "%02x", buf[hex]);
+    }
+    for (n = 0; n < sizeof(buf) - 1; n++) {
+        if (cpu_memory_rw_debug(cs, addr + n, &buf[n], 1, false) != 0) {
+            return;
+        }
+        if (buf[n] == 0) {
+            break;
+        }
+        if (buf[n] < 0x20 || buf[n] > 0x7e) {
+            return;
+        }
+    }
+    if (n < 1 || n >= sizeof(buf) - 1 || buf[n] != 0) {
+        return;
+    }
+    buf[n] = 0;
+    g_string_append_printf(msg, " %s=\"%s\"", tag, buf);
+}
+
+static void user_trace_append_words(CPUState *cs, GString *msg,
+                                    uint32_t addr, unsigned words,
+                                    const char *tag)
+{
+    unsigned i;
+
+    if (!words) {
+        return;
+    }
+    g_string_append_printf(msg, " %s@0x%" PRIx32 "=", tag, addr);
+    for (i = 0; i < words; i++) {
+        uint8_t raw[4];
+
+        if (cpu_memory_rw_debug(cs, (vaddr)addr + (vaddr)i * 4, raw, 4,
+                                false) == 0) {
+            g_string_append_printf(msg, "%s0x%08" PRIx32,
+                                   i ? "," : "", ldl_le_p(raw));
+        } else {
+            g_string_append_printf(msg, "%s????????", i ? "," : "");
+        }
+    }
+}
+
+static void user_trace_dump_guest_map(CPUARMState *env, const char *why)
+{
+    uint64_t ttbr0 = env->cp15.ttbr0_el[1];
+    uint32_t asid = extract32(env->cp15.contextidr_el[1], 0, 8);
+    uint32_t ttbcr = (uint32_t)env->cp15.tcr_el[1];
+    unsigned n = extract32(ttbcr, 0, 3);
+    unsigned shift = 14 - n;
+    hwaddr ttb = (hwaddr)ttbr0 & ~((1ull << shift) - 1);
+    uint32_t va;
+    uint32_t range_start = 0;
+    bool in_range = false;
+    uint64_t mapped = 0;
+    uint64_t low = 0;
+    uint64_t high = 0;
+    uint64_t heap = 0;
+    unsigned ranges = 0;
+    unsigned printed = 0;
+    uint32_t brk = 0;
+    uint64_t ram = current_machine ? (uint64_t)current_machine->ram_size : 0;
+    uint32_t dram_pages = 0;
+    uint8_t dram_seen[4096];
+    int64_t ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    memset(dram_seen, 0, sizeof(dram_seen));
+    qemu_log("user-trace-mem ns=%" PRId64 " why=%s ttbr0=0x%" PRIx64
+             " asid=0x%" PRIx32 " ttbcr=0x%" PRIx32 " ttb=0x%" HWADDR_PRIx
+             " ram=%" PRIu64 "\n",
+             ns, why, ttbr0, asid, ttbcr, ttb, ram);
+    if (!ttb) {
+        qemu_log("user-trace-mem-summary why=%s mapped=0\n", why);
+        return;
+    }
+
+    for (va = 0; va < 0xc0000000; ) {
+        uint32_t l1 = user_trace_phys_ldl(ttb + (hwaddr)(va >> 20) * 4);
+        uint32_t type = l1 & 3;
+        uint32_t chunk = 0x100000;
+        bool present = false;
+        hwaddr phys = 0;
+
+        if (type == 2) {
+            present = true;
+            if (l1 & (1u << 18)) {
+                chunk = 0x1000000;
+                phys = l1 & 0xff000000;
+            } else {
+                phys = l1 & 0xfff00000;
+            }
+        } else if (type == 1) {
+            hwaddr l2 = l1 & 0xfffffc00;
+            uint32_t j;
+
+            chunk = 0x1000;
+            for (j = 0; j < 256; j++) {
+                uint32_t d2 = user_trace_phys_ldl(l2 + j * 4);
+                uint32_t t2 = d2 & 3;
+                uint32_t psz = 0x1000;
+                bool p2 = false;
+                hwaddr p2phys = 0;
+
+                if (t2 == 1) {
+                    psz = 0x10000;
+                    p2 = true;
+                    p2phys = d2 & 0xffff0000;
+                } else if (t2 & 2) {
+                    p2 = true;
+                    p2phys = d2 & 0xfffff000;
+                }
+                if (p2 != in_range) {
+                    if (in_range) {
+                        if (printed < 256) {
+                            qemu_log("user-trace-map va=0x%08" PRIx32
+                                     "-0x%08" PRIx32 " size=0x%" PRIx32 "\n",
+                                     range_start, va, va - range_start);
+                            printed++;
+                        }
+                        ranges++;
+                    }
+                    in_range = p2;
+                    range_start = va;
+                }
+                if (p2) {
+                    uint32_t off;
+
+                    mapped += psz;
+                    if (va < 0x40000000) {
+                        low += psz;
+                        if (va >= 0x2a000) {
+                            heap += psz;
+                        }
+                    } else {
+                        high += psz;
+                    }
+                    for (off = 0; off < psz; off += 0x1000) {
+                        uint64_t dram = (uint64_t)p2phys + off;
+
+                        if (dram >= 0x80000000ull &&
+                            dram < 0x80000000ull + ram) {
+                            uint32_t page = (uint32_t)((dram - 0x80000000ull) >> 12);
+                            unsigned byte = page / 8;
+                            unsigned bit = page % 8;
+
+                            if (byte < sizeof(dram_seen) &&
+                                !(dram_seen[byte] & (1u << bit))) {
+                                dram_seen[byte] |= 1u << bit;
+                                dram_pages++;
+                            }
+                        }
+                    }
+                }
+                va += psz;
+                if (psz > 0x1000) {
+                    j += (psz / 0x1000) - 1;
+                }
+            }
+            continue;
+        }
+
+        if (present != in_range) {
+            if (in_range) {
+                if (printed < 256) {
+                    qemu_log("user-trace-map va=0x%08" PRIx32 "-0x%08" PRIx32
+                             " size=0x%" PRIx32 "\n",
+                             range_start, va, va - range_start);
+                    printed++;
+                }
+                ranges++;
+            }
+            in_range = present;
+            range_start = va;
+        }
+        if (present) {
+            uint32_t off;
+
+            mapped += chunk;
+            if (va < 0x40000000) {
+                low += chunk;
+                if (va >= 0x2a000) {
+                    heap += chunk;
+                }
+            } else {
+                high += chunk;
+            }
+            for (off = 0; off < chunk; off += 0x1000) {
+                uint64_t dram = (uint64_t)phys + off;
+
+                if (dram >= 0x80000000ull && dram < 0x80000000ull + ram) {
+                    uint32_t page = (uint32_t)((dram - 0x80000000ull) >> 12);
+                    unsigned byte = page / 8;
+                    unsigned bit = page % 8;
+
+                    if (byte < sizeof(dram_seen) &&
+                        !(dram_seen[byte] & (1u << bit))) {
+                        dram_seen[byte] |= 1u << bit;
+                        dram_pages++;
+                    }
+                }
+            }
+        }
+        va += chunk;
+    }
+    if (in_range) {
+        if (printed < 256) {
+            qemu_log("user-trace-map va=0x%08" PRIx32 "-0x%08" PRIx32
+                     " size=0x%" PRIx32 "\n",
+                     range_start, va, va - range_start);
+        }
+        ranges++;
+    }
+    qemu_log("user-trace-mem-summary ns=%" PRId64 " why=%s mapped=0x%" PRIx64
+             " low=0x%" PRIx64 " heapish=0x%" PRIx64 " mmap=0x%" PRIx64
+             " ranges=%u dram_pages=%u dram_bytes=0x%" PRIx64
+             " guest_ram=0x%" PRIx64,
+             ns, why, mapped, low, heap, high, ranges, dram_pages,
+             (uint64_t)dram_pages << 12, ram);
+    if (user_trace_last_brk(&brk)) {
+        qemu_log(" brk=0x%" PRIx32, brk);
+    }
+    qemu_log("\n");
+}
+
+static void user_trace_maybe_mem(CPUARMState *env, const char *why, bool force)
+{
+    int64_t sec = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000000000LL;
+    int due;
+
+    if (force) {
+        user_trace_dump_guest_map(env, why);
+    }
+    while ((due = user_trace_mem_due(sec)) >= 0) {
+        user_trace_mem_mark(due);
+        user_trace_dump_guest_map(env, why);
+    }
+}
+
+void HELPER(user_trace_pc)(CPUARMState *env, uint32_t pc)
+{
+    CPUState *cs = env_cpu(env);
+    uint32_t cpsr = cpsr_read(env);
+    uint64_t ttbr0 = env->cp15.ttbr0_el[1];
+    uint32_t asid = extract32(env->cp15.contextidr_el[1], 0, 8);
+    int64_t ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    GString *msg = g_string_new(NULL);
+    unsigned words = user_trace_pc_stack_words();
+    unsigned code_words = user_trace_pc_code_words();
+    unsigned i;
+
+    if (!user_trace_allow_as(pc, ttbr0, asid)) {
+        g_string_free(msg, TRUE);
+        return;
+    }
+
+    g_string_append_printf(msg,
+        "user-trace-pc ns=%" PRId64 " pc=0x%" PRIx32 " lr=0x%" PRIx32
+        " sp=0x%" PRIx32 " cpsr=0x%" PRIx32 " ttbr0=0x%" PRIx64
+        " asid=0x%" PRIx32 " el=%d",
+        ns, pc, env->regs[14], env->regs[13], cpsr, ttbr0, asid,
+        arm_current_el(env));
+    for (i = 0; i <= 12; i++) {
+        g_string_append_printf(msg, " r%u=0x%" PRIx32, i, env->regs[i]);
+    }
+    if (words) {
+        g_string_append(msg, " stack=");
+        for (i = 0; i < words; i++) {
+            uint8_t raw[4];
+            vaddr addr = (vaddr)env->regs[13] + (vaddr)i * 4;
+
+            if (cpu_memory_rw_debug(cs, addr, raw, 4, false) == 0) {
+                g_string_append_printf(msg, "%s0x%08" PRIx32,
+                                       i ? "," : "", ldl_le_p(raw));
+            } else {
+                g_string_append_printf(msg, "%s????????", i ? "," : "");
+            }
+        }
+    }
+    if (user_trace_code_pc_match(pc) || user_trace_ring_pc_match(pc)) {
+        for (i = 0; i < 4; i++) {
+            char tag[8];
+
+            g_snprintf(tag, sizeof(tag), "str%u", i);
+            user_trace_append_string(cs, msg, env->regs[i], tag);
+        }
+    }
+    if (code_words && user_trace_code_pc_match(pc)) {
+        uint32_t code_addr = env->regs[14] & ~3u;
+
+        if (code_addr >= 64) {
+            code_addr -= 64;
+        }
+        user_trace_append_words(cs, msg, code_addr, code_words, "lrcode");
+    }
+    user_trace_pc_log(msg->str);
+    g_string_free(msg, TRUE);
+    user_trace_maybe_mem(env, "pc", false);
+    if (user_trace_ring_pc_match(pc)) {
+        user_trace_maybe_mem(env, "abort", true);
+        hw_event_ring_dump();
+    }
+}
+
+void HELPER(user_trace_svc)(CPUARMState *env, uint32_t pc)
+{
+    CPUState *cs = env_cpu(env);
+    uint64_t ttbr0 = env->cp15.ttbr0_el[1];
+    uint32_t asid = extract32(env->cp15.contextidr_el[1], 0, 8);
+    uint32_t nr = env->regs[7];
+    uint32_t retpc;
+
+    if (arm_current_el(env) != 0 || !user_trace_syscall_match(nr) ||
+        !user_trace_as_learned() || !user_trace_as_matches(ttbr0, asid)) {
+        return;
+    }
+    retpc = pc + (env->thumb ? 2 : 4);
+    user_trace_svc_arm_enter(pc, retpc, nr, env->regs[0], env->regs[1],
+                             env->regs[2], env->regs[3], env->regs[4],
+                             env->regs[5], ttbr0, asid);
+    tb_flush(cs);
+}
+
+void HELPER(user_trace_svc_ret)(CPUARMState *env, uint32_t pc)
+{
+    uint64_t ttbr0 = env->cp15.ttbr0_el[1];
+    uint32_t asid = extract32(env->cp15.contextidr_el[1], 0, 8);
+
+    if (!user_trace_svc_ret_pending(pc)) {
+        return;
+    }
+    if (user_trace_as_learned() && !user_trace_as_matches(ttbr0, asid)) {
+        return;
+    }
+    user_trace_svc_arm_leave(pc, env->regs[0]);
+    user_trace_maybe_mem(env, "svc-ret", false);
+}
+#endif

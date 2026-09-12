@@ -30,8 +30,11 @@
 #include "hw/sysbus.h"
 #include "migration/vmstate.h"
 #include "qemu/error-report.h"
+#include "qemu/crc32c.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "qemu/timer.h"
+#include "qemu/user-trace-pc.h"
 #include "qom/object.h"
 #include "trace.h"
 
@@ -286,6 +289,60 @@ static void onenand_trace_config(OneNANDState *s, bool is_write,
     }
 }
 
+static uint32_t onenand_cal_crc(const uint8_t *data, uint32_t length)
+{
+    if (!data || !length) {
+        return 0;
+    }
+    return crc32c(0xffffffff, data, length);
+}
+
+static void onenand_trace_cal(OneNANDState *s, const char *op,
+                              uint64_t offset, uint32_t length,
+                              const uint8_t *data_in,
+                              const uint8_t *data_out, int ok)
+{
+    uint64_t trace_end;
+    uint64_t access_end;
+    uint64_t overlap_start;
+    uint64_t overlap_end;
+    uint32_t overlap_len;
+    uint32_t crc_in;
+    uint32_t crc_out;
+    uint32_t block;
+    uint32_t page;
+    int64_t ns;
+    const uint8_t *in_ptr;
+    const uint8_t *out_ptr;
+
+    if (!s->config_trace_length) {
+        return;
+    }
+    trace_end = s->config_trace_start + s->config_trace_length;
+    access_end = offset + length;
+    overlap_start = MAX(offset, s->config_trace_start);
+    overlap_end = MIN(access_end, trace_end);
+    if (overlap_start >= overlap_end) {
+        return;
+    }
+    overlap_len = overlap_end - overlap_start;
+    in_ptr = data_in ? data_in + (overlap_start - offset) : NULL;
+    out_ptr = data_out ? data_out + (overlap_start - offset) : NULL;
+    crc_in = onenand_cal_crc(in_ptr, overlap_len);
+    crc_out = onenand_cal_crc(out_ptr, overlap_len);
+    block = overlap_start >> BLOCK_SHIFT;
+    page = (overlap_start >> PAGE_SHIFT) & 63;
+    ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    trace_rx44_cal_access(ns, op, overlap_start,
+                          overlap_start - s->config_trace_start,
+                          block, page, overlap_len, crc_in, crc_out, ok);
+    hw_event_ring_record(
+        "CAL %s abs=0x%" PRIx64 " rel=0x%" PRIx64 " blk=%u pg=%u len=%u "
+        "crc_in=0x%08x crc_out=0x%08x ok=%d",
+        op, overlap_start, overlap_start - s->config_trace_start,
+        block, page, overlap_len, crc_in, crc_out, ok);
+}
+
 static inline int onenand_load_main(OneNANDState *s, int sec, int secn,
                 void *dest)
 {
@@ -305,6 +362,8 @@ static inline int onenand_load_main(OneNANDState *s, int sec, int secn,
     if (!result) {
         onenand_trace_config(s, false, offset, length, dest);
     }
+    onenand_trace_cal(s, "read", offset, length,
+                      result ? NULL : dest, result ? NULL : dest, !result);
     return result;
 }
 
@@ -344,6 +403,8 @@ static inline int onenand_prog_main(OneNANDState *s, int sec, int secn,
         if (!result) {
             onenand_trace_config(s, true, offset, size, dp);
         }
+        onenand_trace_cal(s, "program", offset, size, sp,
+                          (!result && dp) ? dp : NULL, !result);
         if (dp && s->blk_cur) {
             g_free(dp);
         }
@@ -414,6 +475,8 @@ static inline int onenand_prog_spare(OneNANDState *s, int sec, int secn,
 static inline int onenand_erase(OneNANDState *s, int sec, int num)
 {
     uint8_t *blankbuf, *tmpbuf;
+    int start_sec = sec;
+    int start_num = num;
 
     blankbuf = g_malloc(512);
     tmpbuf = g_malloc(512);
@@ -446,11 +509,19 @@ static inline int onenand_erase(OneNANDState *s, int sec, int num)
 
     g_free(tmpbuf);
     g_free(blankbuf);
+    onenand_trace_cal(s, "erase",
+                      (uint64_t)start_sec << BDRV_SECTOR_BITS,
+                      (uint32_t)start_num << BDRV_SECTOR_BITS,
+                      NULL, NULL, 1);
     return 0;
 
 fail:
     g_free(tmpbuf);
     g_free(blankbuf);
+    onenand_trace_cal(s, "erase",
+                      (uint64_t)start_sec << BDRV_SECTOR_BITS,
+                      (uint32_t)start_num << BDRV_SECTOR_BITS,
+                      NULL, NULL, 0);
     return 1;
 }
 

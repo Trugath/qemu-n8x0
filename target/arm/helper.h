@@ -1099,6 +1099,12 @@ DEF_HELPER_FLAGS_4(gvec_uminp_b, TCG_CALL_NO_RWG, void, ptr, ptr, ptr, i32)
 DEF_HELPER_FLAGS_4(gvec_uminp_h, TCG_CALL_NO_RWG, void, ptr, ptr, ptr, i32)
 DEF_HELPER_FLAGS_4(gvec_uminp_s, TCG_CALL_NO_RWG, void, ptr, ptr, ptr, i32)
 
+#ifndef CONFIG_USER_ONLY
+DEF_HELPER_2(user_trace_pc, void, env, i32)
+DEF_HELPER_2(user_trace_svc, void, env, i32)
+DEF_HELPER_2(user_trace_svc_ret, void, env, i32)
+#endif
+
 #ifdef TARGET_AARCH64
 #include "tcg/helper-a64.h"
 #include "tcg/helper-sve.h"

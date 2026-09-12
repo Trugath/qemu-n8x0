@@ -4684,6 +4684,79 @@ SRST
     Output log in logfile instead of to stderr
 ERST
 
+DEF("user-trace-pc", HAS_ARG, QEMU_OPTION_user_trace_pc, \
+    "-user-trace-pc addr[,addr...]  log GPR/TTBR/stack when guest virtual PCs execute\n",
+    QEMU_ARCH_ALL)
+SRST
+``-user-trace-pc addr[,addr...]``
+    Host-side debugging: when a guest virtual PC executes, log virtual
+    time, PC, LR, SP, R0-R12, CPSR, TTBR0, ASID, and a configurable
+    number of stack words. The facility is not a guest-visible device.
+ERST
+
+DEF("user-trace-stack-words", HAS_ARG, QEMU_OPTION_user_trace_stack_words, \
+    "-user-trace-stack-words N      words of stack to dump at each user-trace-pc hit (default 16)\n",
+    QEMU_ARCH_ALL)
+SRST
+``-user-trace-stack-words N``
+    Number of 32-bit stack words to dump at each ``-user-trace-pc`` hit.
+    Default 16, maximum 64.
+ERST
+
+DEF("user-trace-ring-pc", HAS_ARG, QEMU_OPTION_user_trace_ring_pc, \
+    "-user-trace-ring-pc addr[,addr...]  dump the hardware event ring at these PCs\n",
+    QEMU_ARCH_ALL)
+SRST
+``-user-trace-ring-pc addr[,addr...]``
+    Host-side debugging: dump the 1024-entry RETU/TAHVO/CAL ring when these
+    guest virtual PCs execute. The facility is not a guest-visible device.
+ERST
+
+DEF("user-trace-learn-pc", HAS_ARG, QEMU_OPTION_user_trace_learn_pc, \
+    "-user-trace-learn-pc addr[,addr...]  lock later traces to the first matching address space\n",
+    QEMU_ARCH_ALL)
+SRST
+``-user-trace-learn-pc addr[,addr...]``
+    When one of these PCs first executes, remember its TTBR0/ASID and ignore
+    later user-trace hits from other address spaces.
+ERST
+
+DEF("user-trace-code-pc", HAS_ARG, QEMU_OPTION_user_trace_code_pc, \
+    "-user-trace-code-pc addr[,addr...]  dump words around LR at these PCs\n",
+    QEMU_ARCH_ALL)
+SRST
+``-user-trace-code-pc addr[,addr...]``
+    Dump ``-user-trace-code-words`` guest instructions around LR when these
+    PCs execute.
+ERST
+
+DEF("user-trace-code-words", HAS_ARG, QEMU_OPTION_user_trace_code_words, \
+    "-user-trace-code-words N      words of code around LR to dump (default 0)\n",
+    QEMU_ARCH_ALL)
+SRST
+``-user-trace-code-words N``
+    Number of 32-bit words to dump around LR at ``-user-trace-code-pc`` hits.
+    Default 0, maximum 64.
+ERST
+
+DEF("user-trace-syscall", HAS_ARG, QEMU_OPTION_user_trace_syscall, \
+    "-user-trace-syscall name|nr[,...]  log selected EL0 syscalls after learn-pc\n",
+    QEMU_ARCH_ALL)
+SRST
+``-user-trace-syscall name|nr[,...]``
+    Log ARM EABI syscall entry and return for the named calls. Recognised
+    names are ``brk``, ``mmap``, ``mmap2``, and ``munmap``.
+ERST
+
+DEF("user-trace-mem-times", HAS_ARG, QEMU_OPTION_user_trace_mem_times, \
+    "-user-trace-mem-times sec[,sec...]  dump the learned process map at these times\n",
+    QEMU_ARCH_ALL)
+SRST
+``-user-trace-mem-times sec[,sec...]``
+    Dump the learned address space's mapped ranges at the first matching
+    user-trace event after each virtual-time second.
+ERST
+
 DEF("dfilter", HAS_ARG, QEMU_OPTION_DFILTER, \
     "-dfilter range,..  filter debug output to range of addresses (useful for -d cpu,exec,etc..)\n",
     QEMU_ARCH_ALL)

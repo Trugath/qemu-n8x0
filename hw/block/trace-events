@@ -3,6 +3,7 @@
 # onenand.c -- enabled only for the RX-44 config partition
 rx44_config_read(uint64_t absolute, uint64_t relative, uint32_t length, uint64_t preview, uint32_t preview_length) "absolute=0x%"PRIx64" relative=0x%"PRIx64" length=%"PRIu32" preview=0x%016"PRIx64" preview_length=%"PRIu32
 rx44_config_write(uint64_t absolute, uint64_t relative, uint32_t length, uint64_t preview, uint32_t preview_length) "absolute=0x%"PRIx64" relative=0x%"PRIx64" length=%"PRIu32" preview=0x%016"PRIx64" preview_length=%"PRIu32
+rx44_cal_access(int64_t ns, const char *op, uint64_t absolute, uint64_t relative, uint32_t block, uint32_t page, uint32_t length, uint32_t crc_in, uint32_t crc_out, int ok) "ns=%"PRId64" op=%s absolute=0x%"PRIx64" relative=0x%"PRIx64" block=%"PRIu32" page=%"PRIu32" length=%"PRIu32" crc_in=0x%08x crc_out=0x%08x ok=%d"
 
 # fdc.c
 fdc_ioport_read(uint8_t reg, uint8_t value) "read reg 0x%02x val 0x%02x"

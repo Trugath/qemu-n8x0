@@ -22,6 +22,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/timer.h"
+#include "qemu/user-trace-pc.h"
 #include "hw/hw.h"
 #include "hw/irq.h"
 #include "hw/misc/cbus.h"
@@ -380,6 +381,32 @@ static inline void retu_write(CBusRetu *s, int reg, uint16_t val)
     }
 }
 
+static void retu_record(CBusRetu *s, int rw, int reg, uint16_t val)
+{
+    const char *name;
+
+    switch (reg) {
+    case RETU_REG_IDR:
+        name = "IDR";
+        break;
+    case RETU_REG_IMR:
+        name = "IMR";
+        break;
+    case RETU_REG_ADCR:
+        name = "ADCR";
+        break;
+    case RETU_REG_STATUS:
+        name = "STATUS";
+        break;
+    default:
+        return;
+    }
+    hw_event_ring_record(
+        "RETU %s %s=0x%04x ch=%u adc=0x%03x status=0x%04x irqst=0x%04x irqen=0x%04x",
+        rw ? "rd" : "wr", name, val, s->channel, s->result[s->channel],
+        s->status, s->irqst, s->irqen);
+}
+
 static void retu_io(void *opaque, int rw, int reg, uint16_t *val)
 {
     CBusRetu *s = (CBusRetu *) opaque;
@@ -388,6 +415,7 @@ static void retu_io(void *opaque, int rw, int reg, uint16_t *val)
         *val = retu_read(s, reg);
     else
         retu_write(s, reg, *val);
+    retu_record(s, rw, reg, *val);
 }
 
 void *retu_init(qemu_irq irq, int vilma)
@@ -533,8 +561,14 @@ static void tahvo_ibat_schedule(CBusTahvo *s)
 static void tahvo_ibat_tick(void *opaque)
 {
     CBusTahvo *s = opaque;
+    uint16_t prev = s->irqst;
 
     s->irqst |= 1 << TAHVO_INT_BATCURR;
+    if (!(prev & (1 << TAHVO_INT_BATCURR))) {
+        hw_event_ring_record(
+            "TAHVO IRQ7 0->1 irqst=0x%04x irqen=0x%04x curr=%d",
+            s->irqst, s->irqen, s->batcurr);
+    }
     tahvo_interrupt_update(s);
     tahvo_ibat_schedule(s);
 }
@@ -642,6 +676,27 @@ static inline void tahvo_write(CBusTahvo *s, int reg, uint16_t val)
     }
 }
 
+static void tahvo_record(CBusTahvo *s, int rw, int reg, uint16_t val)
+{
+    switch (reg) {
+    case TAHVO_REG_IDR:
+    case TAHVO_REG_IDSR:
+    case TAHVO_REG_IMR:
+    case TAHVO_REG_CHAPWMR:
+    case TAHVO_REG_CHGCTL:
+    case TAHVO_REG_BATCURRTIMER:
+    case TAHVO_REG_BATCURR:
+        break;
+    default:
+        return;
+    }
+    hw_event_ring_record(
+        "TAHVO %s reg=0x%02x val=0x%04x chapwm=0x%02x chgctl=0x%04x "
+        "timer=%u curr=%d irqst=0x%04x irqen=0x%04x",
+        rw ? "rd" : "wr", reg, val, s->charger, s->ctl, s->batcurr_timer,
+        s->batcurr, s->irqst, s->irqen);
+}
+
 static void tahvo_io(void *opaque, int rw, int reg, uint16_t *val)
 {
     CBusTahvo *s = (CBusTahvo *) opaque;
@@ -650,6 +705,7 @@ static void tahvo_io(void *opaque, int rw, int reg, uint16_t *val)
         *val = tahvo_read(s, reg);
     else
         tahvo_write(s, reg, *val);
+    tahvo_record(s, rw, reg, *val);
 }
 
 void *tahvo_init(qemu_irq irq, int betty)

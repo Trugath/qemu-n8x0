@@ -23,6 +23,9 @@
 #include "translate.h"
 #include "translate-a32.h"
 #include "qemu/log.h"
+#ifndef CONFIG_USER_ONLY
+#include "qemu/user-trace-pc.h"
+#endif
 #include "arm_ldst.h"
 #include "semihosting/semihost.h"
 #include "cpregs.h"
@@ -6977,6 +6980,12 @@ static bool trans_SVC(DisasContext *s, arg_SVC *a)
             uint32_t syndrome = syn_aa32_svc(a->imm, s->thumb);
             gen_exception_insn_el(s, 0, EXCP_UDEF, syndrome, 2);
         } else {
+#ifndef CONFIG_USER_ONLY
+            if (s->current_el == 0 && user_trace_syscall_enabled()) {
+                gen_helper_user_trace_svc(tcg_env,
+                                          tcg_constant_i32(s->pc_curr));
+            }
+#endif
             gen_update_pc(s, curr_insn_len(s));
             s->svc_imm = a->imm;
             s->base.is_jmp = DISAS_SWI;
@@ -7771,6 +7780,14 @@ static void arm_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
     }
 
     dc->pc_curr = pc;
+#ifndef CONFIG_USER_ONLY
+    if (user_trace_pc_match(pc)) {
+        gen_helper_user_trace_pc(tcg_env, tcg_constant_i32(pc));
+    }
+    if (user_trace_svc_ret_pending(pc)) {
+        gen_helper_user_trace_svc_ret(tcg_env, tcg_constant_i32(pc));
+    }
+#endif
     insn = arm_ldl_code(env, &dc->base, pc, dc->sctlr_b);
     dc->insn = insn;
     dc->base.pc_next = pc + 4;
@@ -7848,6 +7865,14 @@ static void thumb_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
     }
 
     dc->pc_curr = pc;
+#ifndef CONFIG_USER_ONLY
+    if (user_trace_pc_match(pc)) {
+        gen_helper_user_trace_pc(tcg_env, tcg_constant_i32(pc));
+    }
+    if (user_trace_svc_ret_pending(pc)) {
+        gen_helper_user_trace_svc_ret(tcg_env, tcg_constant_i32(pc));
+    }
+#endif
     insn = arm_lduw_code(env, &dc->base, pc, dc->sctlr_b);
     is_16bit = thumb_insn_is_16bit(dc, dc->base.pc_next, insn);
     pc += 2;

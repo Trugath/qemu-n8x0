@@ -48,6 +48,7 @@
 
 #include "qemu/error-report.h"
 #include "qemu/sockets.h"
+#include "qemu/user-trace-pc.h"
 #include "qemu/accel.h"
 #include "qemu/async-teardown.h"
 #include "hw/usb.h"
@@ -3040,6 +3041,44 @@ void qemu_init(int argc, char **argv)
                 break;
             case QEMU_OPTION_d:
                 log_mask = optarg;
+                break;
+            case QEMU_OPTION_user_trace_pc:
+                user_trace_pc_parse(optarg);
+                break;
+            case QEMU_OPTION_user_trace_stack_words: {
+                uint64_t words;
+                if (qemu_strtou64(optarg, NULL, 0, &words) || words > 64) {
+                    error_report("invalid -user-trace-stack-words '%s'",
+                                 optarg);
+                    exit(1);
+                }
+                user_trace_pc_set_stack_words((unsigned)words);
+                break;
+            }
+            case QEMU_OPTION_user_trace_ring_pc:
+                user_trace_ring_pc_parse(optarg);
+                break;
+            case QEMU_OPTION_user_trace_learn_pc:
+                user_trace_learn_pc_parse(optarg);
+                break;
+            case QEMU_OPTION_user_trace_code_pc:
+                user_trace_code_pc_parse(optarg);
+                break;
+            case QEMU_OPTION_user_trace_code_words: {
+                uint64_t words;
+                if (qemu_strtou64(optarg, NULL, 0, &words) || words > 64) {
+                    error_report("invalid -user-trace-code-words '%s'",
+                                 optarg);
+                    exit(1);
+                }
+                user_trace_pc_set_code_words((unsigned)words);
+                break;
+            }
+            case QEMU_OPTION_user_trace_syscall:
+                user_trace_syscall_parse(optarg);
+                break;
+            case QEMU_OPTION_user_trace_mem_times:
+                user_trace_mem_times_parse(optarg);
                 break;
             case QEMU_OPTION_D:
                 log_file = optarg;
