@@ -842,8 +842,10 @@ static void tusb6010_realize(DeviceState *dev, Error **errp)
 
     s->otg_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, tusb_otg_tick, s);
     s->pwr_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, tusb_power_tick, s);
-    memory_region_init_io(&s->iomem[1], OBJECT(s), &tusb_async_ops, s,
+    memory_region_init_io(&s->iomem[0], OBJECT(s), &tusb_async_ops, s,
                           "tusb-async", UINT32_MAX);
+    memory_region_init_io(&s->iomem[1], OBJECT(s), &tusb_async_ops, s,
+                          "tusb-sync", UINT32_MAX);
     sysbus_init_mmio(sbd, &s->iomem[0]);
     sysbus_init_mmio(sbd, &s->iomem[1]);
     sysbus_init_irq(sbd, &s->irq);
