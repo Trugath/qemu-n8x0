@@ -19,9 +19,11 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/core/cpu.h"
 #include "hw/irq.h"
 #include "qemu/timer.h"
 #include "hw/arm/omap.h"
+#include "trace.h"
 
 /* GP timers */
 struct omap_gp_timer_s {
@@ -68,6 +70,10 @@ struct omap_gp_timer_s {
     uint32_t capture_val[2];
     uint32_t match_val;
     int capt_num;
+
+    uint64_t audit_reads;
+    int64_t audit_host_start;
+    int64_t audit_virtual_start;
 
     uint16_t writeh;	/* LSB */
     uint16_t readh;	/* MSB */
@@ -223,6 +229,7 @@ static void omap_gp_timer_clk_update(void *opaque, int line, int on)
 
     omap_gp_timer_sync(timer);
     timer->rate = on ? omap_clk_getrate(timer->clk) : 0;
+    trace_omap_gptimer_clock(timer, on, timer->rate);
     omap_gp_timer_update(timer);
 }
 
@@ -231,6 +238,7 @@ static void omap_gp_timer_clk_setup(struct omap_gp_timer_s *timer)
     omap_clk_adduser(timer->clk,
                      qemu_allocate_irq(omap_gp_timer_clk_update, timer, 0));
     timer->rate = omap_clk_getrate(timer->clk);
+    trace_omap_gptimer_clock(timer, timer->rate != 0, timer->rate);
 }
 
 void omap_gp_timer_reset(struct omap_gp_timer_s *s)
@@ -298,7 +306,21 @@ static uint32_t omap_gp_timer_readw(void *opaque, hwaddr addr)
                 (s->st << 0);
 
     case 0x28:	/* TCRR */
-        return omap_gp_timer_read(s);
+    {
+        uint32_t value = omap_gp_timer_read(s);
+        uint64_t reads = ++s->audit_reads;
+
+        if (!(reads & (reads - 1))) {
+            trace_omap_gptimer_sample(
+                s, current_cpu ?
+                   CPU_GET_CLASS(current_cpu)->get_pc(current_cpu) : 0,
+                reads, value,
+                qemu_clock_get_ns(QEMU_CLOCK_HOST) - s->audit_host_start,
+                qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->audit_virtual_start,
+                s->rate, s->ticks_per_sec, s->pre, s->ptv);
+        }
+        return value;
+    }
 
     case 0x2c:	/* TLDR */
         return s->load_val;
@@ -403,6 +425,11 @@ static void omap_gp_timer_write(void *opaque, hwaddr addr, uint32_t value)
             omap_gp_timer_out(s, s->scpwm);
         /* TODO: make sure this doesn't overflow 32-bits */
         s->ticks_per_sec = NANOSECONDS_PER_SECOND << (s->pre ? s->ptv + 1 : 0);
+        s->audit_reads = 0;
+        s->audit_host_start = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+        s->audit_virtual_start = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        trace_omap_gptimer_config(s, value, s->rate, s->ticks_per_sec,
+                                  s->pre, s->ptv);
         omap_gp_timer_update(s);
         break;
 

@@ -24,6 +24,11 @@ grlib_gptimer_hit(int id) "timer:%d HIT"
 grlib_gptimer_readl(int id, uint64_t addr, uint32_t val) "timer:%d addr 0x%"PRIx64" 0x%x"
 grlib_gptimer_writel(int id, uint64_t addr, uint32_t val) "timer:%d addr 0x%"PRIx64" 0x%x"
 
+# omap_gptimer.c
+omap_gptimer_clock(void *timer, bool enabled, int64_t rate) "timer=%p enabled=%d fclk=%"PRId64"Hz"
+omap_gptimer_config(void *timer, uint32_t tclr, int64_t rate, int64_t ticks_per_sec, int pre, int ptv) "timer=%p TCLR=0x%08"PRIx32" fclk=%"PRId64"Hz ticks_per_sec=%"PRId64" pre=%d ptv=%d"
+omap_gptimer_sample(void *timer, uint64_t pc, uint64_t reads, uint32_t tcrr, int64_t host_elapsed_ns, int64_t virtual_elapsed_ns, int64_t rate, int64_t ticks_per_sec, int pre, int ptv) "timer=%p pc=0x%"PRIx64" reads=%"PRIu64" TCRR=0x%08"PRIx32" host_elapsed_ns=%"PRId64" virtual_elapsed_ns=%"PRId64" fclk=%"PRId64"Hz ticks_per_sec=%"PRId64" pre=%d ptv=%d"
+
 # aspeed_timer.c
 aspeed_timer_ctrl_enable(uint8_t i, bool enable) "Timer %" PRIu8 ": %d"
 aspeed_timer_ctrl_external_clock(uint8_t i, bool enable) "Timer %" PRIu8 ": %d"
