@@ -23,6 +23,7 @@
 #include "ui/console.h"
 #include "hw/display/blizzard.h"
 #include "ui/pixel_ops.h"
+#include "trace.h"
 
 typedef void (*blizzard_fn_t)(uint8_t *, const uint8_t *, unsigned int);
 
@@ -143,6 +144,8 @@ static void blizzard_window(BlizzardState *s)
     int y;
     blizzard_fn_t fn = s->data.line_fn;
 
+    trace_blizzard_update(s->data.x, s->data.y, s->data.dx, s->data.dy,
+                          s->data.pitch);
     if (!fn)
         return;
     if (s->mx[0] > s->data.x)
@@ -483,6 +486,7 @@ static void blizzard_reg_write(void *opaque, uint8_t reg, uint16_t value)
 {
     BlizzardState *s = (BlizzardState *) opaque;
 
+    trace_blizzard_reg_write(reg, value);
     switch (reg) {
     case 0x04:  /* PLL M-Divider */
         s->pll = (value & 0x3f) + 1;

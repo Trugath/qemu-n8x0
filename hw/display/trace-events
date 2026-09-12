@@ -9,6 +9,13 @@ xenfb_mouse_event(void *opaque, int dx, int dy, int dz, int button_state, int ab
 xenfb_key_event(void *opaque, int scancode, int button_state) "%p scancode %d bs 0x%x"
 xenfb_input_connected(void *xendev, int abs_pointer_wanted) "%p abs %d"
 
+# omap_dss.c / blizzard.c
+omap_dss_dispc_write(uint64_t offset, uint64_t value) "offset=0x%"PRIx64" value=0x%"PRIx64
+omap_rfbi_write(uint64_t offset, uint64_t value) "offset=0x%"PRIx64" value=0x%"PRIx64
+omap_rfbi_transfer(uint64_t address, int pixels, int pitch) "address=0x%"PRIx64" pixels=%d pitch=%d"
+blizzard_reg_write(uint8_t reg, uint16_t value) "reg=0x%02x value=0x%04x"
+blizzard_update(int x, int y, int width, int height, int pitch) "x=%d y=%d width=%d height=%d pitch=%d"
+
 # g364fb.c
 g364fb_read(uint64_t addr, uint32_t val) "read addr=0x%"PRIx64": 0x%x"
 g364fb_write(uint64_t addr, uint32_t new) "write addr=0x%"PRIx64": 0x%x"

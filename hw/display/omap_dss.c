@@ -24,6 +24,7 @@
 #include "hw/irq.h"
 #include "ui/console.h"
 #include "hw/arm/omap.h"
+#include "trace.h"
 
 struct omap_dss_s {
     qemu_irq irq;
@@ -386,6 +387,7 @@ static void omap_disc_write(void *opaque, hwaddr addr,
         return;
     }
 
+    trace_omap_dss_dispc_write(addr, value);
     switch (addr) {
     case 0x010: /* DISPC_SYSCONFIG */
         if (value & 2)                      /* SOFTRESET */
@@ -611,6 +613,7 @@ static void omap_rfbi_transfer_start(struct omap_dss_s *s)
     hwaddr len;
     hwaddr data_addr;
     int pitch;
+    int pixels;
     static void *bounce_buffer;
     static hwaddr bounce_len;
 
@@ -630,7 +633,8 @@ static void omap_rfbi_transfer_start(struct omap_dss_s *s)
 
     s->rfbi.busy = 1;
 
-    len = s->rfbi.pixels * 2;
+    pixels = s->rfbi.pixels;
+    len = pixels * 2;
 
     data_addr = s->dispc.l[0].addr[0];
     data = cpu_physical_memory_map(data_addr, &len, false);
@@ -652,6 +656,7 @@ static void omap_rfbi_transfer_start(struct omap_dss_s *s)
 
     /* TODO: negative values */
     pitch = s->dispc.l[0].nx + (s->dispc.l[0].rowinc - 1) / 2;
+    trace_omap_rfbi_transfer(data_addr, pixels, pitch);
 
     if ((s->rfbi.control & (1 << 2)) && s->rfbi.chip[0])
         s->rfbi.chip[0]->block(s->rfbi.chip[0]->opaque, 1, data, len, pitch);
@@ -745,6 +750,7 @@ static void omap_rfbi_write(void *opaque, hwaddr addr,
         return;
     }
 
+    trace_omap_rfbi_write(addr, value);
     switch (addr) {
     case 0x10:  /* RFBI_SYSCONFIG */
         if (value & 2)                      /* SOFTRESET */
