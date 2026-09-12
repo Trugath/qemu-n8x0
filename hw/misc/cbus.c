@@ -21,6 +21,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/timer.h"
 #include "hw/hw.h"
 #include "hw/irq.h"
 #include "hw/misc/cbus.h"
@@ -476,6 +477,11 @@ typedef struct {
     uint8_t backlight;
     uint16_t usbr;
     uint16_t power;
+    uint16_t ctl;
+    uint16_t ccr2;
+    uint8_t batcurr_timer;
+    int16_t batcurr;
+    QEMUTimer *ibat_timer;
 
     int is_betty;
     qemu_irq irq;
@@ -495,12 +501,42 @@ static void tahvo_interrupt_update(CBusTahvo *s)
 #define TAHVO_REG_LEDPWMR	0x05	/* (RW) LED PWM */
 #define TAHVO_REG_USBR		0x06	/* (RW) USB control */
 #define TAHVO_REG_RCR		0x07	/* (RW) Some kind of power management */
-#define TAHVO_REG_CCR1		0x08	/* (RW) Common control register 1 */
+#define TAHVO_REG_CHGCTL	0x08	/* (RW) Charge control */
 #define TAHVO_REG_CCR2		0x09	/* (RW) Common control register 2 */
 #define TAHVO_REG_TESTR1	0x0a	/* (RW) Test register 1 */
 #define TAHVO_REG_TESTR2	0x0b	/* (RW) Test register 2 */
-#define TAHVO_REG_NOPR		0x0c	/* (RW) Number of periods */
-#define TAHVO_REG_FRR		0x0d	/* (RO) FR */
+#define TAHVO_REG_BATCURRTIMER	0x0c	/* (RW) Battery current measure timer */
+#define TAHVO_REG_BATCURR	0x0d	/* (RO) Battery current */
+
+#define TAHVO_INT_BATCURR	7
+
+#define TAHVO_CHGCTL_CURMEAS	0x0040
+#define TAHVO_CHGCTL_CURTIMRST	0x0080
+
+/*
+ * OpenWrt's n810bm converts a millisecond interval to this 8-bit register
+ * with a multiply that yields one count per 250 ms.
+ */
+#define TAHVO_BATCURR_TICK_NS	250000000LL
+
+static void tahvo_ibat_schedule(CBusTahvo *s)
+{
+    if (!s->batcurr_timer || !(s->ctl & TAHVO_CHGCTL_CURMEAS)) {
+        timer_del(s->ibat_timer);
+        return;
+    }
+    timer_mod(s->ibat_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              (int64_t) s->batcurr_timer * TAHVO_BATCURR_TICK_NS);
+}
+
+static void tahvo_ibat_tick(void *opaque)
+{
+    CBusTahvo *s = opaque;
+
+    s->irqst |= 1 << TAHVO_INT_BATCURR;
+    tahvo_interrupt_update(s);
+    tahvo_ibat_schedule(s);
+}
 
 static inline uint16_t tahvo_read(CBusTahvo *s, int reg)
 {
@@ -531,13 +567,17 @@ static inline uint16_t tahvo_read(CBusTahvo *s, int reg)
     case TAHVO_REG_RCR:
         return s->power;
 
-    case TAHVO_REG_CCR1:
+    case TAHVO_REG_CHGCTL:
+        return s->ctl;
     case TAHVO_REG_CCR2:
+        return s->ccr2;
     case TAHVO_REG_TESTR1:
     case TAHVO_REG_TESTR2:
-    case TAHVO_REG_NOPR:
-    case TAHVO_REG_FRR:
         return 0x0000;
+    case TAHVO_REG_BATCURRTIMER:
+        return s->batcurr_timer;
+    case TAHVO_REG_BATCURR:
+        return (uint16_t) s->batcurr;
 
     default:
         hw_error("%s: bad register %02x\n", __func__, reg);
@@ -581,12 +621,19 @@ static inline void tahvo_write(CBusTahvo *s, int reg, uint16_t val)
         s->power = val;
         break;
 
-    case TAHVO_REG_CCR1:
+    case TAHVO_REG_CHGCTL:
+        s->ctl = val;
+        tahvo_ibat_schedule(s);
+        break;
     case TAHVO_REG_CCR2:
+        s->ccr2 = val;
+        break;
     case TAHVO_REG_TESTR1:
     case TAHVO_REG_TESTR2:
-    case TAHVO_REG_NOPR:
-    case TAHVO_REG_FRR:
+        break;
+    case TAHVO_REG_BATCURRTIMER:
+        s->batcurr_timer = val & 0xff;
+        tahvo_ibat_schedule(s);
         break;
 
     default:
@@ -612,6 +659,7 @@ void *tahvo_init(qemu_irq irq, int betty)
     s->irqen = 0xffff;
     s->irqst = 0x0000;
     s->is_betty = !!betty;
+    s->ibat_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, tahvo_ibat_tick, s);
 
     s->cbus.opaque = s;
     s->cbus.io = tahvo_io;
