@@ -209,6 +209,7 @@ static void retu_interrupt_update(CBusRetu *s)
 #define RETU_REG_SCR2		0x1f	/* (RW) */
 
 #define RETU_STATUS_BATAVAIL	0x0100	/* Battery available */
+#define RETU_ADC_CHG_DISCONNECTED	0	/* Mer: ADC#3 == 0 when not charging */
 
 /* Retu Interrupt sources */
 enum {
@@ -401,7 +402,7 @@ void *retu_init(qemu_irq irq, int vilma)
     s->rtc.cal = 0x01;
     s->result[retu_adc_bsi] = 0x3c2;
     s->result[retu_adc_batt_temp] = 0x0fc;
-    s->result[retu_adc_chg_volt] = 0x165;
+    s->result[retu_adc_chg_volt] = RETU_ADC_CHG_DISCONNECTED;
     s->result[retu_adc_head_det] = 123;
     s->result[retu_adc_hook_det] = 1023;
     s->result[retu_adc_rf_gp] = 0x11;
