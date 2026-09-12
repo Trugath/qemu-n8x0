@@ -13,6 +13,11 @@ nrf51_gpio_write(uint64_t offset, uint64_t value) "offset 0x%" PRIx64 " value 0x
 nrf51_gpio_set(int64_t line, int64_t value) "line %" PRIi64 " value %" PRIi64
 nrf51_gpio_update_output_irq(int64_t line, int64_t value) "line %" PRIi64 " value %" PRIi64
 
+# omap_gpio.c
+omap2_gpio_input(int gpio, int level) "gpio=%d level=%d"
+omap2_gpio_output(int gpio, int level) "gpio=%d level=%d"
+omap2_gpio_irq(int bank, uint32_t status, uint32_t mask, int level) "bank=%d status=0x%08x mask=0x%08x level=%d"
+
 # pca9552.c
 pca955x_gpio_status(const char *description, const char *buf) "%s GPIOs 0-15 [%s]"
 pca955x_gpio_change(const char *description, unsigned id, unsigned prev_state, unsigned current_state) "%s GPIO id:%u status: %u -> %u"

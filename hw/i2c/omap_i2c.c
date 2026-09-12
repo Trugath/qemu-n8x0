@@ -27,6 +27,7 @@
 #include "hw/sysbus.h"
 #include "qemu/error-report.h"
 #include "qapi/error.h"
+#include "trace.h"
 
 struct OMAPI2CState {
     SysBusDevice parent_obj;
@@ -60,7 +61,10 @@ struct OMAPI2CState {
 
 static void omap_i2c_interrupts_update(OMAPI2CState *s)
 {
-    qemu_set_irq(s->irq, s->stat & s->mask);
+    int level = !!(s->stat & s->mask);
+
+    trace_omap_i2c_irq(s->stat, s->mask, level);
+    qemu_set_irq(s->irq, level);
     if ((s->dma >> 15) & 1)					/* RDMA_EN */
         qemu_set_irq(s->drq[0], (s->stat >> 3) & 1);		/* RRDY */
     if ((s->dma >> 7) & 1)					/* XDMA_EN */
@@ -160,6 +164,7 @@ static uint32_t omap_i2c_read(void *opaque, hwaddr addr)
 {
     OMAPI2CState *s = opaque;
     int offset = addr & OMAP_MPUI_REG_MASK;
+    int bytes;
     uint16_t ret;
 
     switch (offset) {
@@ -195,6 +200,7 @@ static uint32_t omap_i2c_read(void *opaque, hwaddr addr)
         return s->count_cur;					/* DCOUNT */
 
     case 0x1c:	/* I2C_DATA */
+        bytes = MIN(s->rxlen, 2);
         ret = 0;
         if (s->control & (1 << 14)) {				/* BE */
             ret |= ((s->fifo >> 0) & 0xff) << 8;
@@ -212,6 +218,10 @@ static uint32_t omap_i2c_read(void *opaque, hwaddr addr)
             s->rxlen -= 2;
         } else {
             /* XXX: remote access (qualifier) error - what's that?  */
+        }
+        trace_omap_i2c_data(s->addr[1], true, ret & 0xff);
+        if (bytes > 1) {
+            trace_omap_i2c_data(s->addr[1], true, ret >> 8);
         }
         if (!s->rxlen) {
             s->stat &= ~(1 << 3);				/* RRDY */
@@ -352,6 +362,8 @@ static void omap_i2c_write(void *opaque, hwaddr addr,
             break;
         }
         if ((value & (1 << 15)) && value & (1 << 0)) {		/* STT */
+            trace_omap_i2c_start(s->addr[1], (~value >> 9) & 1,
+                                 s->count, (value >> 1) & 1);
             nack = !!i2c_start_transfer(s->bus, s->addr[1],	/* SA */
                             (~value >> 9) & 1);			/* TRX */
             s->stat |= nack << 1;				/* NACK */
@@ -414,6 +426,7 @@ static void omap_i2c_writeb(void *opaque, hwaddr addr,
 
     switch (offset) {
     case 0x1c:	/* I2C_DATA */
+        trace_omap_i2c_data(s->addr[1], false, value);
         if (s->txlen > 2) {
             /* XXX: remote access (qualifier) error - what's that?  */
             break;

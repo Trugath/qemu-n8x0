@@ -49,6 +49,11 @@ hid_kbd_queue_empty(void) "queue empty"
 # tsc2005.c
 tsc2005_sense(const char *state) "touchscreen sense %s"
 
+# lm832x.c
+lm8323_command(uint8_t command, bool write) "command=0x%02x write=%d"
+lm8323_key_event(int key, int pressed) "scan=0x%02x pressed=%d"
+lm8323_irq(int level, uint8_t status) "level=%d status=0x%02x"
+
 # virtio-input.c
 virtio_input_queue_full(void) "queue full"
 

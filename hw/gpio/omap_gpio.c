@@ -27,6 +27,7 @@
 #include "qemu/error-report.h"
 #include "qemu/module.h"
 #include "qapi/error.h"
+#include "trace.h"
 
 struct omap_gpio_s {
     qemu_irq irq;
@@ -208,6 +209,7 @@ struct omap2_gpio_s {
     uint32_t ints[2];
     uint32_t debounce;
     uint8_t delay;
+    int bank;
 };
 
 struct Omap2GpioState {
@@ -228,7 +230,10 @@ struct Omap2GpioState {
 static inline void omap2_gpio_module_int_update(struct omap2_gpio_s *s,
                                                 int line)
 {
-    qemu_set_irq(s->irq[line], s->ints[line] & s->mask[line]);
+    int level = !!(s->ints[line] & s->mask[line]);
+
+    trace_omap2_gpio_irq(s->bank, s->ints[line], s->mask[line], level);
+    qemu_set_irq(s->irq[line], level);
 }
 
 static void omap2_gpio_module_wake(struct omap2_gpio_s *s, int line)
@@ -251,7 +256,10 @@ static inline void omap2_gpio_module_out_update(struct omap2_gpio_s *s,
     s->outputs ^= diff;
     diff &= ~s->dir;
     while ((ln = ctz32(diff)) != 32) {
-        qemu_set_irq(s->handler[ln], (s->outputs >> ln) & 1);
+        int level = (s->outputs >> ln) & 1;
+
+        trace_omap2_gpio_output(s->bank * 32 + ln, level);
+        qemu_set_irq(s->handler[ln], level);
         diff &= ~(1 << ln);
     }
 }
@@ -277,6 +285,7 @@ static void omap2_gpio_set(void *opaque, int line, int level)
     Omap2GpioState *p = opaque;
     struct omap2_gpio_s *s = &p->modules[line >> 5];
 
+    trace_omap2_gpio_input(line, level);
     line &= 31;
     if (level) {
         if (s->dir & (1 << line) & ((~s->inputs & s->edge[0]) | s->level[1]))
@@ -732,6 +741,7 @@ static void omap2_gpio_realize(DeviceState *dev, Error **errp)
         }
 
         m->revision = (s->mpu_model < omap3430) ? 0x18 : 0x25;
+        m->bank = i;
         m->handler = &s->handler[i * 32];
         sysbus_init_irq(sbd, &m->irq[0]); /* mpu irq */
         sysbus_init_irq(sbd, &m->irq[1]); /* dsp irq */

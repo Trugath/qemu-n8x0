@@ -27,6 +27,7 @@
 #include "qemu/timer.h"
 #include "ui/console.h"
 #include "qom/object.h"
+#include "trace.h"
 
 OBJECT_DECLARE_SIMPLE_TYPE(LM823KbdState, LM8323)
 
@@ -87,7 +88,10 @@ struct LM823KbdState {
 
 static void lm_kbd_irq_update(LM823KbdState *s)
 {
-    qemu_set_irq(s->nirq, !s->status);
+    int level = !s->status;
+
+    trace_lm8323_irq(level, s->status);
+    qemu_set_irq(s->nirq, level);
 }
 
 static void lm_kbd_gpio_update(LM823KbdState *s)
@@ -195,32 +199,16 @@ static uint8_t lm_kbd_read(LM823KbdState *s, int reg, int byte)
         break;
 
     case LM832x_CMD_READ_FIFO:
-        if (s->kbd.len <= 1)
+        if (!s->kbd.len) {
             return 0x00;
+        }
 
-        /* Example response from the two commands after a INT_KEYPAD
-         * interrupt caused by the key 0x3c being pressed:
-         * RPT_READ_FIFO: 55 bc 00 4e ff 0a 50 08 00 29 d9 08 01 c9 01
-         *     READ_FIFO: bc 00 00 4e ff 0a 50 08 00 29 d9 08 01 c9 01
-         * RPT_READ_FIFO: bc 00 00 4e ff 0a 50 08 00 29 d9 08 01 c9 01
-         *
-         * 55 is the code of the key release event serviced in the previous
-         * interrupt handling.
-         *
-         * TODO: find out whether the FIFO is advanced a single character
-         * before reading every byte or the whole size of the FIFO at the
-         * last LM832x_CMD_READ_FIFO.  This affects LM832x_CMD_RPT_READ_FIFO
-         * output in cases where there are more than one event in the FIFO.
-         * Assume 0xbc and 0x3c events are in the FIFO:
-         * RPT_READ_FIFO: 55 bc 3c 00 4e ff 0a 50 08 00 29 d9 08 01 c9
-         *     READ_FIFO: bc 3c 00 00 4e ff 0a 50 08 00 29 d9 08 01 c9
-         * Does RPT_READ_FIFO now return 0xbc and 0x3c or only 0x3c?
-         */
+        ret = s->kbd.fifo[s->kbd.start];
         s->kbd.start ++;
         s->kbd.start &= sizeof(s->kbd.fifo) - 1;
         s->kbd.len --;
 
-        return s->kbd.fifo[s->kbd.start];
+        return ret;
     case LM832x_CMD_RPT_READ_FIFO:
         if (byte >= s->kbd.len)
             return 0x00;
@@ -397,6 +385,9 @@ static int lm_i2c_event(I2CSlave *i2c, enum i2c_event event)
     case I2C_START_SEND:
         s->i2c_cycle = 0;
         s->i2c_dir = (event == I2C_START_SEND);
+        if (event == I2C_START_RECV) {
+            trace_lm8323_command(s->reg, false);
+        }
         break;
 
     default:
@@ -417,10 +408,12 @@ static int lm_i2c_tx(I2CSlave *i2c, uint8_t data)
 {
     LM823KbdState *s = LM8323(i2c);
 
-    if (!s->i2c_cycle)
+    if (!s->i2c_cycle) {
+        trace_lm8323_command(data, true);
         s->reg = data;
-    else
+    } else {
         lm_kbd_write(s, s->reg, s->i2c_cycle - 1, data);
+    }
     s->i2c_cycle ++;
 
     return 0;
@@ -484,6 +477,7 @@ void lm832x_key_event(DeviceState *dev, int key, int state)
 {
     LM823KbdState *s = LM8323(dev);
 
+    trace_lm8323_key_event(key, state);
     if ((s->status & INT_ERROR) && (s->error & ERR_FIFOOVR))
         return;
 
