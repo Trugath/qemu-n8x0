@@ -373,6 +373,18 @@ void musb_reset(MUSBState *s)
     }
 }
 
+void musb_set_b_device(MUSBState *s, int b_device)
+{
+    s->devctl &= ~(MGC_M_DEVCTL_BDEVICE | MGC_M_DEVCTL_HM |
+                   MGC_M_DEVCTL_SESSION | MGC_M_DEVCTL_VBUS);
+    s->session = 0;
+    if (b_device) {
+        s->devctl |= MGC_M_DEVCTL_BDEVICE;
+    } else {
+        s->devctl |= MGC_M_DEVCTL_HM;
+    }
+}
+
 struct MUSBState *musb_init(DeviceState *parent_device, int gpio_base)
 {
     MUSBState *s = g_malloc0(sizeof(*s));

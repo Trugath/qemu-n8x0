@@ -707,8 +707,9 @@ static void tusb_power_tick(void *opaque)
     TUSBState *s = (TUSBState *) opaque;
 
     if (s->power) {
+        s->otg_status |= TUSB_DEV_OTG_STAT_PWR_CLK_GOOD;
         s->intr_ok = ~0;
-        tusb_intr_update(s);
+        qemu_irq_lower(s->irq);
     }
 }
 
@@ -765,12 +766,15 @@ static void tusb6010_power(TUSBState *s, int on)
 {
     trace_tusb6010_power(s, on, s->power);
     if (!on) {
+        s->otg_status &= ~TUSB_DEV_OTG_STAT_PWR_CLK_GOOD;
         s->power = 0;
+        s->intr_ok = 0;
+        qemu_irq_raise(s->irq);
     } else if (!s->power && on) {
         s->power = 1;
         /* Pull the interrupt down after TUSB6010 comes up.  */
         s->intr_ok = 0;
-        tusb_intr_update(s);
+        qemu_irq_raise(s->irq);
         timer_mod(s->pwr_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                   NANOSECONDS_PER_SECOND / 2);
     }
@@ -793,7 +797,8 @@ static void tusb6010_reset(DeviceState *dev)
     s->test_reset = TUSB_PROD_TEST_RESET_VAL;
     s->host_mode = 0;
     s->dev_config = 0;
-    s->otg_status = 0;	/* !TUSB_DEV_OTG_STAT_ID_STATUS means host mode */
+    s->otg_status = TUSB_DEV_OTG_STAT_ID_STATUS |
+                    TUSB_DEV_OTG_STAT_SESS_END;
     s->power = 0;
     s->mask = 0xffffffff;
     s->intr = 0x00000000;
@@ -819,6 +824,7 @@ static void tusb6010_reset(DeviceState *dev)
         s->rx_config[i] = s->tx_config[i] = 0;
     }
     musb_reset(s->musb);
+    musb_set_b_device(s->musb, 1);
 }
 
 static void tusb6010_realize(DeviceState *dev, Error **errp)
