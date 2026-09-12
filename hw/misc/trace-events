@@ -1,5 +1,9 @@
 # See docs/devel/tracing.rst for syntax documentation.
 
+# omap_gpmc.c
+omap_gpmc_cs_map(unsigned cs, uint64_t base, uint64_t size, const char *region) "cs=%u base=0x%08" PRIx64 " size=0x%" PRIx64 " region=%s"
+omap_gpmc_config(uint64_t pc, unsigned cs, unsigned reg, uint64_t value) "pc=0x%" PRIx64 " cs=%u config=%u value=0x%" PRIx64
+
 # allwinner-cpucfg.c
 allwinner_cpucfg_cpu_reset(uint8_t cpu_id, uint32_t reset_addr) "id %u, reset_addr 0x%" PRIx32
 allwinner_cpucfg_read(uint64_t offset, uint64_t data, unsigned size) "offset 0x%" PRIx64 " data 0x%" PRIx64 " size %" PRIu32

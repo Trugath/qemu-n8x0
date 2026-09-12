@@ -20,11 +20,13 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/core/cpu.h"
 #include "hw/irq.h"
 #include "hw/block/flash.h"
 #include "hw/arm/omap.h"
 #include "exec/memory.h"
 #include "exec/address-spaces.h"
+#include "trace.h"
 
 /* General-Purpose Memory Controller */
 struct omap_gpmc_s {
@@ -415,6 +417,10 @@ static void omap_gpmc_cs_map(struct omap_gpmc_s *s, int cs)
 
     base <<= 24;
     size = (0x0fffffff & ~(mask << 24)) + 1;
+    trace_omap_gpmc_cs_map(cs, base, size,
+                           !f->iomem ? "nand" :
+                           memory_region_name(f->iomem) ?
+                           memory_region_name(f->iomem) : "unnamed-iomem");
     /* TODO: rather than setting the size of the mapping (which should be
      * constant), the mask should cause wrapping of the address space, so
      * that the same memory becomes accessible at every <i>size</i> bytes
@@ -676,6 +682,9 @@ static void omap_gpmc_write(void *opaque, hwaddr addr,
         cs = (addr - 0x060) / 0x30;
         addr -= cs * 0x30;
         f = s->cs_file + cs;
+        trace_omap_gpmc_config(
+            current_cpu ? CPU_GET_CLASS(current_cpu)->get_pc(current_cpu) : 0,
+            cs, (addr - 0x60) / 4, value);
         switch (addr) {
         case 0x60:      /* GPMC_CONFIG1 */
             f->config[0] = value & 0xffef3e13;

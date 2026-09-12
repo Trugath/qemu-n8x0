@@ -22,6 +22,7 @@
 #include "qemu/osdep.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
+#include "hw/core/cpu.h"
 #include "hw/usb.h"
 #include "hw/usb/hcd-musb.h"
 #include "hw/arm/omap.h"
@@ -73,6 +74,7 @@ struct TUSBState {
 };
 
 #define TUSB_DEVCLOCK			60000000	/* 60 MHz */
+#define TUSB_POWERUP_DELAY_NS		(NANOSECONDS_PER_SECOND / 1000)
 
 #define TUSB_VLYNQ_CTRL			0x004
 
@@ -662,14 +664,20 @@ static uint64_t tusb_async_readfn(void *opaque, hwaddr addr, unsigned size)
     default:
         g_assert_not_reached();
     }
-    trace_tusb6010_read(opaque, addr & 0xfff, size, value);
+    trace_tusb6010_read(opaque,
+                        current_cpu ?
+                        CPU_GET_CLASS(current_cpu)->get_pc(current_cpu) : 0,
+                        addr & 0xfff, size, value);
     return value;
 }
 
 static void tusb_async_writefn(void *opaque, hwaddr addr,
                                uint64_t value, unsigned size)
 {
-    trace_tusb6010_write(opaque, addr & 0xfff, size, value);
+    trace_tusb6010_write(opaque,
+                         current_cpu ?
+                         CPU_GET_CLASS(current_cpu)->get_pc(current_cpu) : 0,
+                         addr & 0xfff, size, value);
     switch (size) {
     case 1:
         tusb_async_writeb(opaque, addr, value);
@@ -776,7 +784,7 @@ static void tusb6010_power(TUSBState *s, int on)
         s->intr_ok = 0;
         qemu_irq_raise(s->irq);
         timer_mod(s->pwr_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                  NANOSECONDS_PER_SECOND / 2);
+                  TUSB_POWERUP_DELAY_NS);
     }
 }
 

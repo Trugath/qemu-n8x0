@@ -1,8 +1,8 @@
 # See docs/devel/tracing.rst for syntax documentation.
 
 # tusb6010.c
-tusb6010_read(void *s, uint64_t offset, unsigned size, uint64_t value) "tusb=%p offset=0x%03" PRIx64 " size=%u value=0x%" PRIx64
-tusb6010_write(void *s, uint64_t offset, unsigned size, uint64_t value) "tusb=%p offset=0x%03" PRIx64 " size=%u value=0x%" PRIx64
+tusb6010_read(void *s, uint64_t pc, uint64_t offset, unsigned size, uint64_t value) "tusb=%p pc=0x%" PRIx64 " offset=0x%03" PRIx64 " size=%u value=0x%" PRIx64
+tusb6010_write(void *s, uint64_t pc, uint64_t offset, unsigned size, uint64_t value) "tusb=%p pc=0x%" PRIx64 " offset=0x%03" PRIx64 " size=%u value=0x%" PRIx64
 tusb6010_power(void *s, int requested, int previous) "tusb=%p requested=%d previous=%d"
 
 # core.c
