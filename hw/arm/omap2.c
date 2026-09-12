@@ -1734,6 +1734,24 @@ static const MemoryRegionOps omap_prcm_ops = {
     .endianness = DEVICE_NATIVE_ENDIAN,
 };
 
+static uint64_t omap_prcm_window1_read(void *opaque, hwaddr addr,
+                                       unsigned size)
+{
+    return omap_prcm_read(opaque, addr + 0x800, size);
+}
+
+static void omap_prcm_window1_write(void *opaque, hwaddr addr,
+                                    uint64_t value, unsigned size)
+{
+    omap_prcm_write(opaque, addr + 0x800, value, size);
+}
+
+static const MemoryRegionOps omap_prcm_window1_ops = {
+    .read = omap_prcm_window1_read,
+    .write = omap_prcm_window1_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+};
+
 static void omap_prcm_reset(struct omap_prcm_s *s)
 {
     s->sysconfig = 0;
@@ -1828,7 +1846,7 @@ static struct omap_prcm_s *omap_prcm_init(struct omap_target_agent_s *ta,
 
     memory_region_init_io(&s->iomem0, NULL, &omap_prcm_ops, s, "omap.pcrm0",
                           omap_l4_region_size(ta, 0));
-    memory_region_init_io(&s->iomem1, NULL, &omap_prcm_ops, s, "omap.pcrm1",
+    memory_region_init_io(&s->iomem1, NULL, &omap_prcm_window1_ops, s, "omap.pcrm1",
                           omap_l4_region_size(ta, 1));
     omap_l4_attach(ta, 0, &s->iomem0);
     omap_l4_attach(ta, 1, &s->iomem1);
