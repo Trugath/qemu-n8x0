@@ -798,8 +798,10 @@ static void omap_rfbi_write(void *opaque, hwaddr addr,
             s->rfbi.chip[1]->write(s->rfbi.chip[1]->opaque, 1, value & 0xffff);
             s->rfbi.chip[1]->write(s->rfbi.chip[1]->opaque, 1, value >> 16);
         }
-        if (!-- s->rfbi.pixels)
+        s->rfbi.pixels -= MIN(s->rfbi.pixels, 2);
+        if (!s->rfbi.pixels) {
             omap_rfbi_transfer_stop(s);
+        }
         break;
     case 0x58:  /* RFBI_READ */
         if ((s->rfbi.control & (1 << 2)) && s->rfbi.chip[0])
