@@ -316,7 +316,8 @@ static inline void retu_write(CBusRetu *s, int reg, uint16_t val)
 
     switch (reg) {
     case RETU_REG_IDR:
-        s->irqst ^= val;
+        /* RETU_IDR_W1C: Linux treats IDR as status_base and ack_base. */
+        s->irqst &= ~val;
         retu_interrupt_update(s);
         break;
 
