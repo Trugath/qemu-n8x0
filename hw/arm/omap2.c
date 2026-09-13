@@ -2585,6 +2585,10 @@ struct omap_mpu_state_s *omap2420_mpu_init(MemoryRegion *sdram_cs0,
                     omap_findclk(s, "func_96m_clk"),
                     omap_findclk(s, "core_l4_iclk"));
 
+    omap2_mailbox_init(omap_l4ta(s->l4, 34),
+                       qdev_get_gpio_in(s->ih[0], OMAP_INT_24XX_MAIL_U0_MPU),
+                       qdev_get_gpio_in(s->ih[0], OMAP_INT_24XX_MAIL_U3_MPU));
+
     /* All register mappings (including those not currently implemented):
      * SystemControlMod	48000000 - 48000fff
      * SystemControlL4	48001000 - 48001fff

@@ -774,6 +774,11 @@ void omap_mcbsp_i2s_attach(struct omap_mcbsp_s *s, I2SCodec *slave);
 void omap_tap_init(struct omap_target_agent_s *ta,
                 struct omap_mpu_state_s *mpu);
 
+struct omap2_mailbox_s;
+struct omap2_mailbox_s *omap2_mailbox_init(struct omap_target_agent_s *ta,
+                                           qemu_irq irq_mpu_dsp,
+                                           qemu_irq irq_mpu_iva);
+
 /* omap_lcdc.c */
 struct omap_lcd_panel_s;
 void omap_lcdc_reset(struct omap_lcd_panel_s *s);
