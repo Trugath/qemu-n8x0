@@ -627,7 +627,8 @@ static inline void tahvo_write(CBusTahvo *s, int reg, uint16_t val)
 
     switch (reg) {
     case TAHVO_REG_IDR:
-        s->irqst ^= val;
+        /* TAHVO_IDR_W1C: Linux treats IDR as status_base and ack_base. */
+        s->irqst &= ~val;
         tahvo_interrupt_update(s);
         break;
 
