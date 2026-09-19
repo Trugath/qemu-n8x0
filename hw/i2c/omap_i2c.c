@@ -362,10 +362,16 @@ static void omap_i2c_write(void *opaque, hwaddr addr,
             break;
         }
         if ((value & (1 << 15)) && value & (1 << 0)) {		/* STT */
-            trace_omap_i2c_start(s->addr[1], (~value >> 9) & 1,
-                                 s->count, (value >> 1) & 1);
             nack = !!i2c_start_transfer(s->bus, s->addr[1],	/* SA */
                             (~value >> 9) & 1);			/* TRX */
+            trace_omap_i2c_start(s->addr[1], (~value >> 9) & 1,
+                                 s->count, (value >> 1) & 1, nack);
+            if (s->addr[1] == 0x18) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "  AIC33 I2C 0x18: %s %s count=%u\n",
+                              ((~value >> 9) & 1) ? "R" : "W",
+                              nack ? "NACK" : "ACK", s->count);
+            }
             s->stat |= nack << 1;				/* NACK */
             s->control &= ~(1 << 0);				/* STT */
             s->fifo = 0;

@@ -87,8 +87,20 @@ static void soc_dma_ch_schedule(struct soc_dma_ch_s *ch, int delay_bytes)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     struct dma_s *dma = (struct dma_s *) ch->dma;
+    int64_t delay;
 
-    timer_mod(ch->timer, now + delay_bytes / dma->channel_freq);
+    /*
+     * channel_freq tracks enabled channels sharing sdma_fclk. If the
+     * clock is still 0, avoid divide-by-zero and schedule immediately so
+     * McSPI TX/RX element-sync can finish 3826.arm without wedging
+     * spi_sync.
+     */
+    if (dma->channel_freq <= 0) {
+        delay = 1;
+    } else {
+        delay = delay_bytes / dma->channel_freq;
+    }
+    timer_mod(ch->timer, now + delay);
 }
 
 static void soc_dma_ch_run(void *opaque)

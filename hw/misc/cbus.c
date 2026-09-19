@@ -22,6 +22,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/timer.h"
+#include "qemu/log.h"
 #include "qemu/user-trace-pc.h"
 #include "hw/hw.h"
 #include "hw/irq.h"
@@ -168,17 +169,35 @@ typedef struct {
     uint16_t status;
 
     struct {
+        uint8_t sec;    /* RTCDSR[5:0], 0..59 */
+        uint8_t min;    /* RTCHMR[5:0], 0..59 */
+        uint8_t hour;   /* RTCHMR[12:8], 0..23 */
+        uint8_t day;    /* RTCDSR[15:8], 0..255 */
+        uint8_t tsd;    /* RTCDSR[6] temperature-shutdown latch */
+        uint16_t alarm; /* RTCHMAR (hours/mins + WD bits) */
         uint16_t cal;
+        int held;       /* CC1 bit 0: RTC held in reset */
+        QEMUTimer *timer;
     } rtc;
 
     int is_vilma;
+    int irq_level;
     qemu_irq irq;
     CBusSlave cbus;
 } CBusRetu;
 
 static void retu_interrupt_update(CBusRetu *s)
 {
-    qemu_set_irq(s->irq, s->irqst & ~s->irqen);
+    int level = !!(s->irqst & ~s->irqen);
+
+    if (s->irq_level != level || user_trace_in_sock_window()) {
+        qemu_log("retu-trace ns=%" PRId64
+                 " op=irq gpio=108 idr=0x%04x imr=0x%04x irq=%d pending=0x%04x\n",
+                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), s->irqst, s->irqen,
+                 level, s->irqst & ~s->irqen);
+        s->irq_level = level;
+    }
+    qemu_set_irq(s->irq, level);
 }
 
 #define RETU_REG_ASICR		0x00	/* (RO) ASIC ID & revision */
@@ -241,6 +260,98 @@ enum {
     retu_adc_self_temp	= 13,	/* RETU temperature */
 };
 
+/*
+ * RETU RTC layout from Linux drivers/cbus/retu-rtc.c (OpenWrt 500-cbus):
+ *   RTCDSR: days[15:8] | TSD[6] | seconds[5:0]
+ *   RTCHMR: hours[12:8] | minutes[5:0] (read-only free-running)
+ *   RTCHMAR: WD[14:13] | alarm hours[12:8] | alarm minutes[5:0]
+ *            hours==24 && mins==60 disables the alarm
+ * CC1 bit 0 holds the RTC in reset; Linux toggles it around retu_rtc_do_reset().
+ * RTCS (IDR bit 2) must tick once per second: retu_rtc_barrier() waits on it.
+ */
+#define RETU_RTC_TSD		(1 << 6)
+#define RETU_RTC_ALARM_OFF	((24 << 8) | 60)
+#define RETU_CC1_RTC_RESET	0x0001
+
+static uint16_t retu_rtc_dsr(CBusRetu *s)
+{
+    return ((uint16_t)s->rtc.day << 8) |
+           (s->rtc.tsd ? RETU_RTC_TSD : 0) |
+           (s->rtc.sec & 0x3f);
+}
+
+static uint16_t retu_rtc_hmr(CBusRetu *s)
+{
+    return ((uint16_t)(s->rtc.hour & 0x1f) << 8) | (s->rtc.min & 0x3f);
+}
+
+static int retu_rtc_alarm_armed(CBusRetu *s)
+{
+    unsigned hours = (s->rtc.alarm >> 8) & 0x1f;
+    unsigned mins = s->rtc.alarm & 0x3f;
+
+    return !(hours == 24 && mins == 60) && !(s->rtc.alarm == 0x7f3f);
+}
+
+static void retu_rtc_schedule(CBusRetu *s)
+{
+    if (!s->rtc.timer || s->rtc.held) {
+        if (s->rtc.timer) {
+            timer_del(s->rtc.timer);
+        }
+        return;
+    }
+    timer_mod(s->rtc.timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + NANOSECONDS_PER_SECOND);
+}
+
+static void retu_rtc_reset_counters(CBusRetu *s)
+{
+    s->rtc.sec = 0;
+    s->rtc.min = 0;
+    s->rtc.hour = 0;
+    s->rtc.day = 0;
+}
+
+static void retu_rtc_tick(void *opaque)
+{
+    CBusRetu *s = opaque;
+
+    if (s->rtc.held) {
+        return;
+    }
+
+    s->rtc.sec++;
+    s->irqst |= 1 << retu_int_rtcs;
+
+    if (s->rtc.sec >= 60) {
+        s->rtc.sec = 0;
+        s->rtc.min++;
+        s->irqst |= 1 << retu_int_rtcm;
+        if (s->rtc.min >= 60) {
+            s->rtc.min = 0;
+            s->rtc.hour++;
+            if (s->rtc.hour >= 24) {
+                s->rtc.hour = 0;
+                if (s->rtc.day < 255) {
+                    s->rtc.day++;
+                }
+                s->irqst |= 1 << retu_int_rtcd;
+            }
+        }
+    }
+
+    if (retu_rtc_alarm_armed(s) &&
+        s->rtc.hour == ((s->rtc.alarm >> 8) & 0x1f) &&
+        s->rtc.min == (s->rtc.alarm & 0x3f) &&
+        s->rtc.sec == 0) {
+        s->irqst |= 1 << retu_int_rtca;
+    }
+
+    retu_interrupt_update(s);
+    retu_rtc_schedule(s);
+}
+
 static inline uint16_t retu_read(CBusRetu *s, int reg)
 {
 #ifdef DEBUG
@@ -258,10 +369,13 @@ static inline uint16_t retu_read(CBusRetu *s, int reg)
         return s->irqen;
 
     case RETU_REG_RTCDSR:
+        return retu_rtc_dsr(s);
+
     case RETU_REG_RTCHMR:
+        return retu_rtc_hmr(s);
+
     case RETU_REG_RTCHMAR:
-        /* TODO */
-        return 0x0000;
+        return s->rtc.alarm;
 
     case RETU_REG_RTCCALR:
         return s->rtc.cal;
@@ -327,8 +441,20 @@ static inline void retu_write(CBusRetu *s, int reg, uint16_t val)
         break;
 
     case RETU_REG_RTCDSR:
+        /*
+         * Linux retu_rtc_time_store writes DSR & (1<<6) to clear the day
+         * counter while preserving the temperature-shutdown latch. Seconds
+         * are otherwise free-running.
+         */
+        s->rtc.tsd = !!(val & RETU_RTC_TSD);
+        s->rtc.day = 0;
+        if (val & 0x3f) {
+            s->rtc.sec = val & 0x3f;
+        }
+        break;
+
     case RETU_REG_RTCHMAR:
-        /* TODO */
+        s->rtc.alarm = val;
         break;
 
     case RETU_REG_RTCCALR:
@@ -348,9 +474,19 @@ static inline void retu_write(CBusRetu *s, int reg, uint16_t val)
     case RETU_REG_ANTIFR:
     case RETU_REG_CALIBR:
 
-    case RETU_REG_CCR1:
+    case RETU_REG_CCR1: {
+        int was_held = s->rtc.held;
+
         s->cc[0] = val;
+        s->rtc.held = !!(val & RETU_CC1_RTC_RESET);
+        if (s->rtc.held && !was_held) {
+            retu_rtc_reset_counters(s);
+            timer_del(s->rtc.timer);
+        } else if (!s->rtc.held && was_held) {
+            retu_rtc_schedule(s);
+        }
         break;
+    }
     case RETU_REG_CCR2:
         s->cc[1] = val;
         break;
@@ -406,6 +542,14 @@ static void retu_record(CBusRetu *s, int rw, int reg, uint16_t val)
         "RETU %s %s=0x%04x ch=%u adc=0x%03x status=0x%04x irqst=0x%04x irqen=0x%04x",
         rw ? "rd" : "wr", name, val, s->channel, s->result[s->channel],
         s->status, s->irqst, s->irqen);
+    if (user_trace_in_sock_window()) {
+        qemu_log("retu-trace ns=%" PRId64
+                 " op=%s reg=%s val=0x%04x idr=0x%04x imr=0x%04x irq=%d "
+                 "gpio=108 status=0x%04x adc=0x%03x\n",
+                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                 rw ? "rd" : "wr", name, val, s->irqst, s->irqen,
+                 !!(s->irqst & ~s->irqen), s->status, s->result[s->channel]);
+    }
 }
 
 static void retu_io(void *opaque, int rw, int reg, uint16_t *val)
@@ -429,6 +573,8 @@ void *retu_init(qemu_irq irq, int vilma)
     s->status = 0x0020 | RETU_STATUS_BATAVAIL;
     s->is_vilma = !!vilma;
     s->rtc.cal = 0x01;
+    s->rtc.alarm = RETU_RTC_ALARM_OFF;
+    s->rtc.timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, retu_rtc_tick, s);
     s->result[retu_adc_bsi] = 0x3c2;
     s->result[retu_adc_batt_temp] = 0x0fc;
     s->result[retu_adc_chg_volt] = RETU_ADC_CHG_DISCONNECTED;
@@ -445,6 +591,8 @@ void *retu_init(qemu_irq irq, int vilma)
     s->cbus.opaque = s;
     s->cbus.io = retu_io;
     s->cbus.addr = 1;
+
+    retu_rtc_schedule(s);
 
     return &s->cbus;
 }
@@ -514,14 +662,10 @@ typedef struct {
     QEMUTimer *ibat_timer;
 
     int is_betty;
+    int irq_level;
     qemu_irq irq;
     CBusSlave cbus;
 } CBusTahvo;
-
-static void tahvo_interrupt_update(CBusTahvo *s)
-{
-    qemu_set_irq(s->irq, s->irqst & ~s->irqen);
-}
 
 #define TAHVO_REG_ASICR		0x00	/* (RO) ASIC ID & revision */
 #define TAHVO_REG_IDR		0x01	/* (T)  Interrupt ID */
@@ -537,6 +681,33 @@ static void tahvo_interrupt_update(CBusTahvo *s)
 #define TAHVO_REG_TESTR2	0x0b	/* (RW) Test register 2 */
 #define TAHVO_REG_BATCURRTIMER	0x0c	/* (RW) Battery current measure timer */
 #define TAHVO_REG_BATCURR	0x0d	/* (RO) Battery current */
+
+static void tahvo_trace(CBusTahvo *s, const char *op, int reg, uint16_t val)
+{
+    int level = !!(s->irqst & ~s->irqen);
+
+    if (!user_trace_in_sock_window()) {
+        return;
+    }
+    qemu_log("tahvo-trace ns=%" PRId64
+             " op=%s gpio=111 reg=0x%02x val=0x%04x"
+             " idr=0x%04x imr=0x%04x irq=%d pending=0x%04x"
+             " curr=%d ctl=0x%04x timer=%u chapwm=0x%02x\n",
+             qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), op, reg, val,
+             s->irqst, s->irqen, level, s->irqst & ~s->irqen,
+             s->batcurr, s->ctl, s->batcurr_timer, s->charger);
+}
+
+static void tahvo_interrupt_update(CBusTahvo *s)
+{
+    int level = !!(s->irqst & ~s->irqen);
+
+    if (s->irq_level != level || user_trace_in_sock_window()) {
+        tahvo_trace(s, "irq", TAHVO_REG_IDR, s->irqst);
+        s->irq_level = level;
+    }
+    qemu_set_irq(s->irq, level);
+}
 
 #define TAHVO_INT_BATCURR	7
 
@@ -697,6 +868,7 @@ static void tahvo_record(CBusTahvo *s, int rw, int reg, uint16_t val)
         "timer=%u curr=%d irqst=0x%04x irqen=0x%04x",
         rw ? "rd" : "wr", reg, val, s->charger, s->ctl, s->batcurr_timer,
         s->batcurr, s->irqst, s->irqen);
+    tahvo_trace(s, rw ? "rd" : "wr", reg, val);
 }
 
 static void tahvo_io(void *opaque, int rw, int reg, uint16_t *val)

@@ -82,6 +82,7 @@ system_ss.add(when: 'CONFIG_OMAP', if_true: files(
   'omap_sdrc.c',
   'omap_tap.c',
   'omap2_mailbox.c',
+  'omap2_camera.c',
 ))
 system_ss.add(when: 'CONFIG_RASPI', if_true: files(
   'bcm2835_mbox.c',

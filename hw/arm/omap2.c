@@ -88,6 +88,8 @@ struct omap_eac_s {
         uint8_t control;
         uint16_t config;
     } modem, bt;
+
+    int probe_logged;
 };
 
 static inline void omap_eac_interrupt_update(struct omap_eac_s *s)
@@ -342,6 +344,14 @@ static uint64_t omap_eac_read(void *opaque, hwaddr addr, unsigned size)
     if (size != 2) {
         return omap_badwidth_read16(opaque, addr);
     }
+    /*
+     * L4 places each 16-bit EAC register in a 32-bit slot. C55x
+     * `_Enable_DMA` / `_Configure_McBSP_I2S` use packed word offsets
+     * (`7f0061` → byte +0xc2). The +2 halfword is that same register.
+     */
+    if (addr & 2) {
+        addr &= ~2ull;
+    }
 
     switch (addr) {
     case 0x000:	/* CPCFR1 */
@@ -436,6 +446,11 @@ static uint64_t omap_eac_read(void *opaque, hwaddr addr, unsigned size)
         return 0x0000;
 
     case 0x100:	/* VERSION_NUMBER */
+        if (!s->probe_logged) {
+            s->probe_logged = 1;
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "EAC probe\n  MMIO 48090000: OK, rev=1.0\n");
+        }
         return 0x0010;
 
     case 0x104:	/* SYSCONFIG */
@@ -457,6 +472,9 @@ static void omap_eac_write(void *opaque, hwaddr addr,
     if (size != 2) {
         omap_badwidth_write16(opaque, addr, value);
         return;
+    }
+    if (addr & 2) {
+        addr &= ~2ull;
     }
 
     switch (addr) {
@@ -1042,6 +1060,8 @@ struct omap_prcm_s {
     uint32_t wkst[3];
     uint32_t rst[4];
     uint32_t rstctrl[1];
+    uint32_t rstctrl_dsp;
+    struct omap2420_dsp_s *dsp;
     uint32_t power[4];
     uint32_t rsttime_wkup;
 
@@ -1281,7 +1301,7 @@ static uint64_t omap_prcm_read(void *opaque, hwaddr addr,
     case 0x848:	/* CM_CLKSTCTRL_DSP */
         return s->clkctrl[3];
     case 0x850:	/* RM_RSTCTRL_DSP */
-        return 0;
+        return s->rstctrl_dsp;
     case 0x858:	/* RM_RSTST_DSP */
         return s->rst[3];
     case 0x8c8:	/* PM_WKDEP_DSP */
@@ -1726,7 +1746,10 @@ static void omap_prcm_write(void *opaque, hwaddr addr,
         s->clkctrl[3] = value & 0x101;
         break;
     case 0x850:	/* RM_RSTCTRL_DSP */
-        /* TODO: reset */
+        s->rstctrl_dsp = value & 7;
+        if (s->dsp) {
+            omap2420_dsp_set_rst1(s->dsp, value & 1);
+        }
         break;
     case 0x858:	/* RM_RSTST_DSP */
         s->rst[3] &= ~value;
@@ -1841,7 +1864,11 @@ static void omap_prcm_reset(struct omap_prcm_s *s)
     s->power[2] = 0x0000c;
     s->power[3] = 0x14;
     s->rstctrl[0] = 1;
+    s->rstctrl_dsp = 1;
     s->rst[3] = 1;
+    if (s->dsp) {
+        omap2420_dsp_set_rst1(s->dsp, 1);
+    }
     omap_prcm_apll_update(s);
     omap_prcm_dpll_update(s);
 }
@@ -2315,6 +2342,9 @@ static void omap2_mpu_reset(void *opaque)
     omap_mmc_reset(mpu->mmc);
     omap_mcspi_reset(mpu->mcspi[0]);
     omap_mcspi_reset(mpu->mcspi[1]);
+    if (mpu->dsp) {
+        omap2420_dsp_reset(mpu->dsp);
+    }
     cpu_reset(CPU(mpu->cpu));
 }
 
@@ -2572,6 +2602,9 @@ struct omap_mpu_state_s *omap2420_mpu_init(MemoryRegion *sdram_cs0,
                     omap_findclk(s, "dss_l3_iclk"),
                     omap_findclk(s, "dss_l4_iclk"));
 
+    s->camera = omap2_camera_init(omap_l4ta(s->l4, 11),
+                    qdev_get_gpio_in(s->ih[0], OMAP_INT_24XX_CAM_IRQ));
+
     omap_sti_init(omap_l4ta(s->l4, 18), sysmem, 0x54000000,
                   qdev_get_gpio_in(s->ih[0], OMAP_INT_24XX_STI),
                   omap_findclk(s, "emul_ck"),
@@ -2585,9 +2618,13 @@ struct omap_mpu_state_s *omap2420_mpu_init(MemoryRegion *sdram_cs0,
                     omap_findclk(s, "func_96m_clk"),
                     omap_findclk(s, "core_l4_iclk"));
 
-    omap2_mailbox_init(omap_l4ta(s->l4, 34),
+    s->mailbox = omap2_mailbox_init(omap_l4ta(s->l4, 34),
                        qdev_get_gpio_in(s->ih[0], OMAP_INT_24XX_MAIL_U0_MPU),
                        qdev_get_gpio_in(s->ih[0], OMAP_INT_24XX_MAIL_U3_MPU));
+    s->dsp = omap2420_dsp_init(sysmem, s->mailbox,
+                               qdev_get_gpio_in(s->ih[0],
+                                                OMAP_INT_24XX_DSP_MMU));
+    s->prcm->dsp = s->dsp;
 
     /* All register mappings (including those not currently implemented):
      * SystemControlMod	48000000 - 48000fff

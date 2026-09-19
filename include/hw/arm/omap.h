@@ -725,6 +725,7 @@ struct omap_uart_s *omap2_uart_init(MemoryRegion *sysmem,
                 qemu_irq txdma, qemu_irq rxdma,
                 const char *label, Chardev *chr);
 void omap_uart_reset(struct omap_uart_s *s);
+void omap_uart_attach(struct omap_uart_s *s, Chardev *chr);
 
 struct omap_mpuio_s;
 qemu_irq *omap_mpuio_in_get(struct omap_mpuio_s *s);
@@ -742,6 +743,10 @@ struct omap_mcspi_s *omap_mcspi_init(struct omap_target_agent_s *ta, int chnum,
 void omap_mcspi_attach(struct omap_mcspi_s *s,
                 uint32_t (*txrx)(void *opaque, uint32_t, int), void *opaque,
                 int chipselect);
+void omap_mcspi_attach_full(struct omap_mcspi_s *s,
+                uint32_t (*txrx)(void *opaque, uint32_t, int),
+                void (*setcs)(void *opaque, int selected),
+                void *opaque, int chipselect);
 void omap_mcspi_reset(struct omap_mcspi_s *s);
 
 struct I2SCodec {
@@ -774,10 +779,27 @@ void omap_mcbsp_i2s_attach(struct omap_mcbsp_s *s, I2SCodec *slave);
 void omap_tap_init(struct omap_target_agent_s *ta,
                 struct omap_mpu_state_s *mpu);
 
+struct omap2_camera_s;
+struct omap2_camera_s *omap2_camera_init(struct omap_target_agent_s *ta,
+                                         qemu_irq irq);
+
 struct omap2_mailbox_s;
 struct omap2_mailbox_s *omap2_mailbox_init(struct omap_target_agent_s *ta,
                                            qemu_irq irq_mpu_dsp,
                                            qemu_irq irq_mpu_iva);
+void omap2_mailbox_set_dsp_irq(struct omap2_mailbox_s *s, qemu_irq irq);
+uint32_t omap2_mailbox_peek(struct omap2_mailbox_s *s, unsigned fifo,
+                             unsigned *count);
+uint32_t omap2_mailbox_find_cmd(struct omap2_mailbox_s *s, unsigned fifo,
+                                unsigned cmd_h, unsigned *count,
+                                unsigned *slot);
+
+struct omap2420_dsp_s;
+struct omap2420_dsp_s *omap2420_dsp_init(MemoryRegion *sysmem,
+                                         struct omap2_mailbox_s *mbox,
+                                         qemu_irq irq_mmu);
+void omap2420_dsp_reset(struct omap2420_dsp_s *s);
+void omap2420_dsp_set_rst1(struct omap2420_dsp_s *s, int asserted);
 
 /* omap_lcdc.c */
 struct omap_lcd_panel_s;
@@ -981,8 +1003,11 @@ struct omap_mpu_state_s {
     struct omap_mcspi_s *mcspi[2];
 
     struct omap_dss_s *dss;
+    struct omap2_camera_s *camera;
 
     struct omap_eac_s *eac;
+    struct omap2_mailbox_s *mailbox;
+    struct omap2420_dsp_s *dsp;
 };
 
 /* omap1.c */

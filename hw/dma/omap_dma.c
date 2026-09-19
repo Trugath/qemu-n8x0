@@ -534,7 +534,15 @@ static void omap_dma_transfer_setup(struct soc_dma_ch_s *dma)
     } else				\
         elements[id] = INT_MAX;
 
-    /* Elements */
+    /* Elements.
+     *
+     * Do not drain the whole block while the DRQ stays held: McSPI is
+     * full-duplex (TX+RX DMA). Bursting TX ahead of RX leaves RXS set,
+     * transfer_run then refuses further shifts, and spi_sync hangs in
+     * cx3110x 3826.arm upload. One element per activation lets TX and RX
+     * DRQs interleave. soc_dma still reschedules with ~0 delay when the
+     * request is level-held, so multi-KB SPI completes without UI freeze.
+     */
     INTR_CHECK(
                     ch->sync && !ch->fs && !ch->bs,
                     omap_dma_intr_element_sync,

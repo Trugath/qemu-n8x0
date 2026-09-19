@@ -42,6 +42,10 @@ config WM8750
     bool
     depends on I2C
 
+config TLV320AIC33
+    bool
+    depends on I2C
+
 config PL041
     bool
 

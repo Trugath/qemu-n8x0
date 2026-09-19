@@ -39,6 +39,10 @@ asc_write_reg(int reg, unsigned size, uint64_t value) "reg=0x%03x size=%u value=
 asc_write_extreg(const char fifo, int reg, unsigned size, uint64_t value) "fifo %c reg=0x%03x size=%u value=0x%"PRIx64
 asc_update_irq(int irq, int a, int b) "set IRQ to %d (A: 0x%x B: 0x%x)"
 
+# tlv320aic33.c
+tlv320aic33_i2c(const char *op, uint8_t page, uint8_t reg, uint8_t val) "%s page=%u reg=0x%02x val=0x%02x"
+tlv320aic33_reset(int asserted) "asserted=%d"
+
 #virtio-snd.c
 virtio_snd_get_config(void *vdev, uint32_t jacks, uint32_t streams, uint32_t chmaps) "snd %p: get_config jacks=%"PRIu32" streams=%"PRIu32" chmaps=%"PRIu32""
 virtio_snd_get_features(void *vdev, uint64_t features) "snd %p: get_features 0x%"PRIx64

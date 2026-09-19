@@ -178,3 +178,8 @@ struct omap_uart_s *omap2_uart_init(MemoryRegion *sysmem,
 
     return s;
 }
+
+void omap_uart_attach(struct omap_uart_s *s, Chardev *chr)
+{
+    serial_mm_set_chardev(s->serial, chr);
+}

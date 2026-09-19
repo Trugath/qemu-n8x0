@@ -6,6 +6,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #include "qemu/osdep.h"
+#include <string.h>
 #include "qemu/log.h"
 #include "cpu.h"
 #include "internals.h"
@@ -1614,6 +1615,284 @@ void HELPER(user_trace_pc)(CPUARMState *env, uint32_t pc)
     }
 }
 
+#ifndef CONFIG_USER_ONLY
+static QEMUTimer *user_trace_sample_timer;
+
+static void user_trace_sample_cb(void *opaque)
+{
+    CPUState *cs = first_cpu;
+    ARMCPU *cpu;
+    CPUARMState *env;
+    uint64_t ttbr0;
+    uint32_t asid;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t period = user_trace_sample_period_ns();
+    int el;
+
+    (void)opaque;
+    if (cs && period > 0) {
+        cpu = ARM_CPU(cs);
+        env = &cpu->env;
+        ttbr0 = env->cp15.ttbr0_el[1];
+        asid = extract32(env->cp15.contextidr_el[1], 0, 8);
+        el = arm_current_el(env);
+        if (user_trace_in_sock_window() && user_trace_sample_enabled()) {
+            if (user_trace_is_bme_as(ttbr0) && user_trace_bme_in_syscall()) {
+                qemu_log("user-trace-sample ns=%" PRId64
+                         " why=syscall el=%d ttbr0=0x%" PRIx64
+                         " asid=0x%" PRIx32 " pc=0x%" PRIx32
+                         " lr=0x%" PRIx32 " r0=0x%" PRIx32 "\n",
+                         now, el, ttbr0, asid, env->regs[15], env->regs[14],
+                         env->regs[0]);
+            } else if (el != 0) {
+                qemu_log("user-trace-sample ns=%" PRId64
+                         " why=kernel el=%d ttbr0=0x%" PRIx64
+                         " asid=0x%" PRIx32 " pc=0x%" PRIx32 "\n",
+                         now, el, ttbr0, asid, env->regs[15]);
+            } else if (!user_trace_is_bme_as(ttbr0)) {
+                qemu_log("user-trace-sample ns=%" PRId64
+                         " why=other-as el=%d ttbr0=0x%" PRIx64
+                         " asid=0x%" PRIx32 " pc=0x%" PRIx32
+                         " lr=0x%" PRIx32 "\n",
+                         now, el, ttbr0, asid, env->regs[15], env->regs[14]);
+            } else {
+                qemu_log("user-trace-sample ns=%" PRId64
+                         " why=userspace el=%d ttbr0=0x%" PRIx64
+                         " asid=0x%" PRIx32 " pc=0x%" PRIx32
+                         " lr=0x%" PRIx32 " r0=0x%" PRIx32
+                         " r1=0x%" PRIx32 " r2=0x%" PRIx32 "\n",
+                         now, el, ttbr0, asid, env->regs[15], env->regs[14],
+                         env->regs[0], env->regs[1], env->regs[2]);
+            }
+        }
+    }
+    if (user_trace_sample_timer && period > 0) {
+        timer_mod(user_trace_sample_timer, now + period);
+    }
+}
+
+static void user_trace_sample_ensure(void)
+{
+    if (user_trace_sample_timer || !user_trace_sample_enabled()) {
+        return;
+    }
+    user_trace_sample_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                           user_trace_sample_cb, NULL);
+    timer_mod(user_trace_sample_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              user_trace_sample_period_ns());
+}
+
+static void user_trace_read_unix_path(CPUState *cs, uint32_t addr, uint32_t len,
+                                      char *out, size_t outsz)
+{
+    uint8_t raw[110];
+    uint32_t n = len > sizeof(raw) ? sizeof(raw) : len;
+    uint16_t family;
+
+    if (!outsz) {
+        return;
+    }
+    out[0] = 0;
+    if (!addr || n < 3) {
+        return;
+    }
+    memset(raw, 0, sizeof(raw));
+    if (cpu_memory_rw_debug(cs, addr, raw, n, false) != 0) {
+        return;
+    }
+    family = (uint16_t)(raw[0] | (raw[1] << 8));
+    if (family != 1) {
+        return;
+    }
+    if (raw[2] == 0 && n > 3) {
+        g_snprintf(out, outsz, "@%s", (const char *)&raw[3]);
+        return;
+    }
+    g_strlcpy(out, (const char *)&raw[2], outsz);
+}
+
+static void user_trace_iov_first(CPUState *cs, uint32_t iov_addr,
+                                 uint32_t *addr, uint32_t *len)
+{
+    uint8_t iov[8];
+
+    *addr = 0;
+    *len = 0;
+    if (!iov_addr) {
+        return;
+    }
+    if (cpu_memory_rw_debug(cs, iov_addr, iov, 8, false) == 0) {
+        *addr = ldl_le_p(iov);
+        *len = ldl_le_p(iov + 4);
+    }
+}
+
+static uint32_t user_trace_copy_guest(CPUState *cs, uint32_t addr, uint32_t len,
+                                      uint8_t *out, uint32_t cap)
+{
+    uint32_t n = len > cap ? cap : len;
+    uint32_t i;
+
+    if (!addr || !n) {
+        return 0;
+    }
+    for (i = 0; i < n; i++) {
+        if (cpu_memory_rw_debug(cs, addr + i, &out[i], 1, false) != 0) {
+            return i;
+        }
+    }
+    return n;
+}
+
+static void user_trace_poll_mask(GString *buf, uint16_t mask)
+{
+    static const struct {
+        uint16_t bit;
+        const char *name;
+    } bits[] = {
+        { 0x0001, "IN" },
+        { 0x0002, "PRI" },
+        { 0x0004, "OUT" },
+        { 0x0008, "ERR" },
+        { 0x0010, "HUP" },
+        { 0x0020, "NVAL" },
+    };
+    unsigned i;
+    bool any = false;
+
+    g_string_append_printf(buf, "0x%x", mask);
+    if (!mask) {
+        return;
+    }
+    g_string_append_c(buf, '(');
+    for (i = 0; i < G_N_ELEMENTS(bits); i++) {
+        if (mask & bits[i].bit) {
+            g_string_append_printf(buf, "%s%s", any ? "|" : "", bits[i].name);
+            any = true;
+        }
+    }
+    g_string_append_c(buf, ')');
+}
+
+static void user_trace_format_poll(CPUState *cs, uint32_t fds, uint32_t nfds,
+                                   uint32_t timeout, bool with_rev,
+                                   char *out, size_t outsz)
+{
+    GString *buf = g_string_new(NULL);
+    uint32_t i;
+    uint32_t shown = nfds > 8 ? 8 : nfds;
+
+    g_string_append_printf(buf, "nfds=%u timeout=%d", nfds, (int32_t)timeout);
+    for (i = 0; i < shown; i++) {
+        uint8_t raw[8];
+
+        if (cpu_memory_rw_debug(cs, fds + i * 8, raw, 8, false) != 0) {
+            break;
+        }
+        g_string_append_printf(buf, " fd%u=%d ev=", i, (int32_t)ldl_le_p(raw));
+        user_trace_poll_mask(buf, lduw_le_p(raw + 4));
+        if (with_rev) {
+            g_string_append(buf, " rev=");
+            user_trace_poll_mask(buf, lduw_le_p(raw + 6));
+        }
+    }
+    g_strlcpy(out, buf->str, outsz);
+    g_string_free(buf, TRUE);
+}
+#endif
+
+static void user_trace_read_c_string(CPUState *cs, uint32_t addr,
+                                     char *out, size_t out_size)
+{
+    size_t n;
+
+    if (!out_size) {
+        return;
+    }
+    out[0] = 0;
+    if (addr < 0x1000) {
+        return;
+    }
+    for (n = 0; n < out_size - 1; n++) {
+        uint8_t byte;
+
+        if (cpu_memory_rw_debug(cs, addr + n, &byte, 1, false) != 0) {
+            break;
+        }
+        if (byte == 0) {
+            break;
+        }
+        if (byte < 0x20 || byte > 0x7e) {
+            out[n] = '?';
+        } else {
+            out[n] = (char)byte;
+        }
+    }
+    out[n] = 0;
+}
+
+static void user_trace_format_mq_attr(CPUState *cs, uint32_t addr,
+                                      GString *out)
+{
+    uint8_t raw[16];
+
+    if (!addr || addr < 0x1000) {
+        g_string_append(out, " attr=null");
+        return;
+    }
+    if (cpu_memory_rw_debug(cs, addr, raw, 16, false) != 0) {
+        g_string_append_printf(out, " attr_ptr=0x%" PRIx32 " attr=unreadable",
+                               addr);
+        return;
+    }
+    g_string_append_printf(out,
+        " attr_ptr=0x%" PRIx32
+        " mq_flags=%d mq_maxmsg=%d mq_msgsize=%d mq_curmsgs=%d",
+        addr, (int32_t)ldl_le_p(raw), (int32_t)ldl_le_p(raw + 4),
+        (int32_t)ldl_le_p(raw + 8), (int32_t)ldl_le_p(raw + 12));
+}
+
+static void user_trace_format_buf(CPUState *cs, uint32_t addr, uint32_t len,
+                                  GString *out)
+{
+    uint8_t raw[USER_TRACE_WRITE_BYTES];
+    uint32_t n = len > USER_TRACE_WRITE_BYTES ? USER_TRACE_WRITE_BYTES : len;
+    uint32_t i;
+
+    g_string_append_printf(out, "buflen=%u cap=%u hex=", len, n);
+    if (!addr || !n) {
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        if (cpu_memory_rw_debug(cs, addr + i, &raw[i], 1, false) != 0) {
+            g_string_append(out, "??");
+            return;
+        }
+        g_string_append_printf(out, "%02x", raw[i]);
+    }
+    g_string_append(out, " ascii=\"");
+    for (i = 0; i < n; i++) {
+        uint8_t c = raw[i];
+
+        if (c == '\\' || c == '"') {
+            g_string_append_c(out, '\\');
+            g_string_append_c(out, (char)c);
+        } else if (c >= 0x20 && c <= 0x7e) {
+            g_string_append_c(out, (char)c);
+        } else if (c == '\n') {
+            g_string_append(out, "\\n");
+        } else if (c == '\r') {
+            g_string_append(out, "\\r");
+        } else if (c == '\t') {
+            g_string_append(out, "\\t");
+        } else {
+            g_string_append_printf(out, "\\x%02x", c);
+        }
+    }
+    g_string_append_c(out, '"');
+}
+
 void HELPER(user_trace_svc)(CPUARMState *env, uint32_t pc)
 {
     CPUState *cs = env_cpu(env);
@@ -1621,30 +1900,322 @@ void HELPER(user_trace_svc)(CPUARMState *env, uint32_t pc)
     uint32_t asid = extract32(env->cp15.contextidr_el[1], 0, 8);
     uint32_t nr = env->regs[7];
     uint32_t retpc;
+    uint32_t io_addr = 0;
+    uint32_t io_len = 0;
+    uint32_t tls = (uint32_t)env->cp15.tpidruro_ns;
 
-    if (arm_current_el(env) != 0 || !user_trace_syscall_match(nr) ||
-        !user_trace_as_learned() || !user_trace_as_matches(ttbr0, asid)) {
+    if (!tls) {
+        tls = (uint32_t)env->cp15.tpidrurw_ns;
+    }
+    bool is_read = user_trace_syscall_is_read(nr);
+    bool is_write = user_trace_syscall_is_write(nr);
+    bool sock_io;
+    bool bme;
+    uint8_t raw[USER_TRACE_SOCK_BYTES_DEFAULT];
+    uint32_t payload_n = 0;
+    char extra[512];
+    GString *buf;
+
+    extra[0] = 0;
+    if (arm_current_el(env) != 0 ||
+        !user_trace_syscall_should_log(nr, ttbr0, asid, env->regs[0])) {
         return;
     }
     retpc = pc + (env->thumb ? 2 : 4);
-    user_trace_svc_arm_enter(pc, retpc, nr, env->regs[0], env->regs[1],
-                             env->regs[2], env->regs[3], env->regs[4],
-                             env->regs[5], ttbr0, asid);
-    tb_flush(cs);
+    sock_io = user_trace_dsmesock_enabled() &&
+              user_trace_sock_fd(ttbr0, env->regs[0]);
+    bme = user_trace_is_bme_as(ttbr0);
+    if (nr == 11) {
+        GString *exec = g_string_new(NULL);
+        uint32_t ai;
+
+        user_trace_read_c_string(cs, env->regs[0], extra, sizeof(extra));
+        g_string_append(exec, extra);
+        g_string_append(exec, " argv=");
+        for (ai = 0; ai < 8; ai++) {
+            uint8_t argptr[4];
+            uint32_t ptr;
+            char arg[96];
+
+            if (!env->regs[1] ||
+                cpu_memory_rw_debug(cs, env->regs[1] + ai * 4, argptr, 4,
+                                    false) != 0) {
+                break;
+            }
+            ptr = ldl_le_p(argptr);
+            if (!ptr) {
+                break;
+            }
+            user_trace_read_c_string(cs, ptr, arg, sizeof(arg));
+            if (ai) {
+                g_string_append_c(exec, ',');
+            }
+            g_string_append_c(exec, '[');
+            g_string_append(exec, arg[0] ? arg : "?");
+            g_string_append_c(exec, ']');
+        }
+        g_strlcpy(extra, exec->str, sizeof(extra));
+        g_string_free(exec, TRUE);
+    } else if (nr == 114) {
+        g_snprintf(extra, sizeof(extra),
+                   "wpid=%d status_ptr=0x%" PRIx32 " options=0x%" PRIx32,
+                   (int32_t)env->regs[0], env->regs[1], env->regs[2]);
+    } else if (nr == 90 || nr == 192) {
+        g_snprintf(extra, sizeof(extra),
+                   "addr=0x%" PRIx32 " len=0x%" PRIx32 " prot=0x%" PRIx32
+                   " flags=0x%" PRIx32 " fd=%d off=0x%" PRIx32,
+                   env->regs[0], env->regs[1], env->regs[2], env->regs[3],
+                   (int32_t)env->regs[4], env->regs[5]);
+    } else if (nr == 5 || nr == 274 || nr == 275) {
+        user_trace_read_c_string(cs, env->regs[0], extra, sizeof(extra));
+        if (nr == 274) {
+            GString *mq = g_string_new(extra);
+            uint32_t flags = env->regs[1];
+            bool have_attr = false;
+            int32_t mq_flags = 0;
+            int32_t mq_maxmsg = 0;
+            int32_t mq_msgsize = 0;
+            int32_t mq_curmsgs = 0;
+
+            g_string_append_printf(mq,
+                " flags=0x%" PRIx32 " mode=0x%" PRIx32
+                " o_creat=%d o_excl=%d o_nonblock=%d",
+                flags, env->regs[2], !!(flags & 0x40), !!(flags & 0x80),
+                !!(flags & 0x800));
+            if ((flags & 0x40) && env->regs[3] >= 0x1000) {
+                uint8_t attrraw[16];
+                unsigned ai;
+
+                user_trace_format_mq_attr(cs, env->regs[3], mq);
+                if (cpu_memory_rw_debug(cs, env->regs[3], attrraw, 16,
+                                        false) == 0) {
+                    have_attr = true;
+                    mq_flags = (int32_t)ldl_le_p(attrraw);
+                    mq_maxmsg = (int32_t)ldl_le_p(attrraw + 4);
+                    mq_msgsize = (int32_t)ldl_le_p(attrraw + 8);
+                    mq_curmsgs = (int32_t)ldl_le_p(attrraw + 12);
+                    g_string_append(mq, " attr_hex=");
+                    for (ai = 0; ai < 16; ai++) {
+                        g_string_append_printf(mq, "%02x", attrraw[ai]);
+                    }
+                }
+            } else {
+                g_string_append(mq, " attr=null");
+            }
+            user_trace_nosmq_note_open(extra, flags, mq_flags, mq_maxmsg,
+                                       mq_msgsize, mq_curmsgs, have_attr);
+            g_strlcpy(extra, mq->str, sizeof(extra));
+            g_string_free(mq, TRUE);
+        }
+    } else if (nr == 322) {
+        user_trace_read_c_string(cs, env->regs[1], extra, sizeof(extra));
+    } else if (nr == 54) {
+        uint32_t req = env->regs[1];
+        uint32_t ioc_nr = req & 0xff;
+        uint32_t ioc_type = (req >> 8) & 0xff;
+        uint32_t ioc_size = (req >> 16) & 0x3fff;
+        uint32_t ioc_dir = (req >> 30) & 3;
+
+        g_snprintf(extra, sizeof(extra),
+                   "fd=%u req=0x%" PRIx32 " arg=0x%" PRIx32
+                   " ioc_dir=%u ioc_type=0x%x ioc_nr=%u ioc_size=%u",
+                   env->regs[0], req, env->regs[2],
+                   ioc_dir, ioc_type, ioc_nr, ioc_size);
+        if (ioc_type == 'D') {
+            size_t pos = strlen(extra);
+
+            g_snprintf(extra + pos, sizeof(extra) - pos, " dsp_ioc=1");
+        }
+        if (env->regs[1] == 0x6000) {
+            size_t pos = strlen(extra);
+
+            g_snprintf(extra + pos, sizeof(extra) - pos,
+                       " urt=URT_IOCT_IRQ_SUBSCR irq=%u", env->regs[2]);
+        }
+        if (env->regs[2] >= 0x1000) {
+            uint8_t argraw[16];
+            uint32_t n = user_trace_copy_guest(cs, env->regs[2], 16, argraw,
+                                               sizeof(argraw));
+            size_t pos = strlen(extra);
+            uint32_t i;
+
+            if (n && pos + 8 < sizeof(extra)) {
+                g_snprintf(extra + pos, sizeof(extra) - pos, " mem=");
+                pos = strlen(extra);
+                for (i = 0; i < n && pos + 2 < sizeof(extra); i++) {
+                    extra[pos++] = "0123456789abcdef"[argraw[i] >> 4];
+                    extra[pos++] = "0123456789abcdef"[argraw[i] & 0xf];
+                    extra[pos] = 0;
+                }
+            }
+            if (env->regs[1] == 0x6005 && n >= 7 &&
+                pos + 48 < sizeof(extra)) {
+                uint32_t field = ldl_le_p(argraw);
+
+                g_snprintf(extra + pos, sizeof(extra) - pos,
+                           " urt=TAHVO_IOCX_WRITE field=0x%" PRIx32
+                           " reg=%u mask=0x%x value=0x%x",
+                           field, (field >> 16) & 0x3f, field & 0xffff,
+                           lduw_le_p(argraw + 4));
+            } else if (env->regs[1] == 0x6004 && n >= 4 &&
+                       pos + 32 < sizeof(extra)) {
+                g_snprintf(extra + pos, sizeof(extra) - pos,
+                           " urt=TAHVO_IOCH_READ field=0x%" PRIx32,
+                           ldl_le_p(argraw));
+            }
+        }
+    } else if (nr == 282 || nr == 283) {
+        user_trace_read_unix_path(cs, env->regs[1], env->regs[2], extra,
+                                  sizeof(extra));
+        if (nr == 282) {
+            user_trace_note_unix_bind(ttbr0, env->regs[0], extra);
+        } else {
+            user_trace_note_unix_connect(ttbr0, env->regs[0], extra);
+        }
+    } else if (nr == 168) {
+        user_trace_format_poll(cs, env->regs[0], env->regs[1], env->regs[2],
+                               false, extra, sizeof(extra));
+    } else if (nr == 142) {
+        g_snprintf(extra, sizeof(extra), "nfds=%u", env->regs[0]);
+    } else if (nr == 276 || nr == 277) {
+        io_addr = env->regs[1];
+        io_len = env->regs[2];
+        if (nr == 276) {
+            buf = g_string_new(NULL);
+            user_trace_format_buf(cs, io_addr, io_len, buf);
+            g_string_append_printf(buf, " prio=%u timeout=%s", env->regs[3],
+                                   env->regs[4] ? "ptr" : "NULL");
+            g_strlcpy(extra, buf->str, sizeof(extra));
+            payload_n = user_trace_copy_guest(cs, io_addr, io_len, raw,
+                                              sizeof(raw));
+            g_string_free(buf, TRUE);
+        } else {
+            g_snprintf(extra, sizeof(extra),
+                       "fd=%u buflen=%u prio_ptr=0x%" PRIx32 " timeout=%s",
+                       env->regs[0], env->regs[2], env->regs[3],
+                       env->regs[4] ? "ptr" : "NULL");
+        }
+    } else if (nr == 279) {
+        buf = g_string_new(NULL);
+        g_string_append_printf(buf, "fd=%u", env->regs[0]);
+        if (env->regs[1] >= 0x1000) {
+            g_string_append(buf, " new");
+            user_trace_format_mq_attr(cs, env->regs[1], buf);
+        } else {
+            g_string_append(buf, " new=null");
+        }
+        if (env->regs[2] >= 0x1000) {
+            g_string_append(buf, " old");
+            user_trace_format_mq_attr(cs, env->regs[2], buf);
+        } else {
+            g_string_append(buf, " old=null");
+        }
+        g_strlcpy(extra, buf->str, sizeof(extra));
+        g_string_free(buf, TRUE);
+    } else if (is_write || is_read) {
+        io_addr = env->regs[1];
+        io_len = env->regs[2];
+        if (nr == 145 || nr == 146) {
+            user_trace_iov_first(cs, env->regs[1], &io_addr, &io_len);
+        }
+        if (is_write) {
+            uint8_t write_raw[USER_TRACE_WRITE_BYTES];
+            uint32_t n = user_trace_copy_guest(cs, io_addr, io_len, write_raw,
+                                               sizeof(write_raw));
+
+            if (sock_io ||
+                user_trace_write_interesting(ttbr0, env->regs[0], write_raw,
+                                             n)) {
+                buf = g_string_new(NULL);
+                user_trace_format_buf(cs, io_addr, io_len, buf);
+                g_strlcpy(extra, buf->str, sizeof(extra));
+                g_string_free(buf, TRUE);
+            }
+            payload_n = n > user_trace_sock_bytes() ? user_trace_sock_bytes()
+                                                    : n;
+            memcpy(raw, write_raw, payload_n);
+        }
+    }
+    user_trace_svc_arm_enter(pc, retpc, env->regs[14], nr,
+                             env->regs[0], env->regs[1], env->regs[2],
+                             env->regs[3], env->regs[4], env->regs[5],
+                             env->regs[6], ttbr0, asid, tls, extra);
+    if (nr == 5 || nr == 274 || nr == 322 || nr == 283) {
+        char path[96];
+        const char *sp;
+
+        g_strlcpy(path, extra, sizeof(path));
+        sp = strchr(path, ' ');
+        if (sp) {
+            path[sp - path] = 0;
+        }
+        user_trace_pending_set_path(retpc, ttbr0, path[0] ? path : extra);
+    }
+    if (nr == 168) {
+        user_trace_pending_set_io(retpc, ttbr0, 0, env->regs[0], env->regs[1],
+                                  false);
+    }
+    if (nr == 276 || nr == 277) {
+        user_trace_pending_set_io(retpc, ttbr0, env->regs[0], io_addr, io_len,
+                                  nr == 277);
+        if (nr == 276 && payload_n) {
+            user_trace_pending_set_payload(retpc, ttbr0, raw, payload_n);
+        }
+    }
+    if ((sock_io || bme) && (is_write || is_read)) {
+        user_trace_pending_set_io(retpc, ttbr0, env->regs[0], io_addr, io_len,
+                                  is_read);
+        if (is_write && payload_n) {
+            user_trace_pending_set_payload(retpc, ttbr0, raw, payload_n);
+        }
+    }
+    user_trace_sample_ensure();
+    if (nr == 37 || nr == 178 || nr == 238 || nr == 268 || nr == 363) {
+        uint32_t sig = (nr == 268 || nr == 363) ? env->regs[2] : env->regs[1];
+
+        if (sig == 6) {
+            user_trace_maybe_mem(env, "sigabrt", true);
+        }
+    }
 }
 
 void HELPER(user_trace_svc_ret)(CPUARMState *env, uint32_t pc)
 {
+    CPUState *cs = env_cpu(env);
     uint64_t ttbr0 = env->cp15.ttbr0_el[1];
     uint32_t asid = extract32(env->cp15.contextidr_el[1], 0, 8);
+    uint32_t addr = 0;
+    uint32_t len = 0;
+    uint32_t nr = 0;
+    int32_t ret;
 
     if (!user_trace_svc_ret_pending(pc)) {
         return;
     }
-    if (user_trace_as_learned() && !user_trace_as_matches(ttbr0, asid)) {
-        return;
+    ret = (int32_t)env->regs[0];
+    if (user_trace_pending_info(pc, ttbr0, &nr, &addr, &len) && nr == 168 &&
+        addr && len) {
+        char extra[512];
+
+        user_trace_format_poll(cs, addr, len, 0, true, extra, sizeof(extra));
+        user_trace_set_ret_extra(extra);
+    } else if (ret > 0 && user_trace_pending_read(pc, ttbr0, &addr, &len)) {
+        uint8_t raw[USER_TRACE_SOCK_BYTES_DEFAULT];
+        uint32_t want = (uint32_t)ret;
+        uint32_t n;
+        GString *buf;
+
+        if (want > user_trace_sock_bytes()) {
+            want = user_trace_sock_bytes();
+        }
+        n = user_trace_copy_guest(cs, addr, want, raw, sizeof(raw));
+        user_trace_pending_set_payload(pc, ttbr0, raw, n);
+        buf = g_string_new(NULL);
+        user_trace_format_buf(cs, addr, (uint32_t)ret, buf);
+        user_trace_set_ret_extra(buf->str);
+        g_string_free(buf, TRUE);
     }
-    user_trace_svc_arm_leave(pc, env->regs[0]);
+    user_trace_svc_arm_eret(pc, env->regs[0], ttbr0, asid);
     user_trace_maybe_mem(env, "svc-ret", false);
 }
 #endif

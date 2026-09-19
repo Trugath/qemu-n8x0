@@ -4740,12 +4740,65 @@ SRST
 ERST
 
 DEF("user-trace-syscall", HAS_ARG, QEMU_OPTION_user_trace_syscall, \
-    "-user-trace-syscall name|nr[,...]  log selected EL0 syscalls after learn-pc\n",
+    "-user-trace-syscall name|nr[,...]  log selected EL0 ARM EABI syscalls\n",
     QEMU_ARCH_ALL)
 SRST
 ``-user-trace-syscall name|nr[,...]``
-    Log ARM EABI syscall entry and return for the named calls. Recognised
-    names are ``brk``, ``mmap``, ``mmap2``, and ``munmap``.
+    Log ARM EABI syscall entry and return. Numbers match Linux 2.6.21
+    Diablo ``unistd-common.h`` with ``__NR_SYSCALL_BASE`` 0. Recognised
+    names include ``kill``, ``tkill``, ``tgkill``, ``rt_sigqueueinfo``,
+    ``rt_tgsigqueueinfo``, ``rt_sigaction``, ``rt_sigprocmask``,
+    ``getpid``, ``gettid``, ``exit``, ``exit_group``, ``write``,
+    ``writev``, ``execve``, ``fork``, ``clone``, ``vfork``, ``brk``,
+    ``mmap``, ``mmap2``, ``munmap``, ``wait4``, and ``getppid``.
+ERST
+
+DEF("user-trace-syscall-window", HAS_ARG, QEMU_OPTION_user_trace_syscall_window, \
+    "-user-trace-syscall-window start,end  virtual-second window for listed syscalls\n",
+    QEMU_ARCH_ALL)
+SRST
+``-user-trace-syscall-window start,end``
+    Only log listed syscalls whose virtual time falls in this inclusive
+    second range. ``execve``/``fork``/``clone``/``wait4`` tracking is not
+    windowed. Processes matching ``-user-trace-write-name`` also bypass
+    the window for listed syscalls.
+ERST
+
+DEF("user-trace-syscall-global", 0, QEMU_OPTION_user_trace_syscall_global, \
+    "-user-trace-syscall-global     do not restrict syscall traces to learn-pc\n",
+    QEMU_ARCH_ALL)
+SRST
+``-user-trace-syscall-global``
+    Log matching syscalls from every address space. ASID is recorded but
+    is not process identity.
+ERST
+
+DEF("user-trace-proc", 0, QEMU_OPTION_user_trace_proc, \
+    "-user-trace-proc               track execve/fork/clone to name and PID\n",
+    QEMU_ARCH_ALL)
+SRST
+``-user-trace-proc``
+    From boot, log ``execve``, ``fork``, ``clone``, and ``vfork`` and
+    bind process name/PID/TID to TTBR0. Do not treat ASID as identity.
+ERST
+
+DEF("user-trace-write-name", HAS_ARG, QEMU_OPTION_user_trace_write_name, \
+    "-user-trace-write-name a,b     capture writes and unwindow listed syscalls for these names\n",
+    QEMU_ARCH_ALL)
+SRST
+``-user-trace-write-name a,b``
+    Copy at most 256 bytes of ``write``/``writev`` userspace buffers for
+    processes whose exec name contains any of these comma-separated
+    substrings. The same names also log listed syscalls outside the
+    syscall window.
+ERST
+
+DEF("user-trace-write-window", HAS_ARG, QEMU_OPTION_user_trace_write_window, \
+    "-user-trace-write-window start,end  virtual-second window for write capture\n",
+    QEMU_ARCH_ALL)
+SRST
+``-user-trace-write-window start,end``
+    Restrict ``write``/``writev`` capture to this virtual-time window.
 ERST
 
 DEF("user-trace-mem-times", HAS_ARG, QEMU_OPTION_user_trace_mem_times, \
@@ -4755,6 +4808,63 @@ SRST
 ``-user-trace-mem-times sec[,sec...]``
     Dump the learned address space's mapped ranges at the first matching
     user-trace event after each virtual-time second.
+ERST
+
+DEF("user-trace-dsmesock", 0, QEMU_OPTION_user_trace_dsmesock, \
+    "-user-trace-dsmesock           track /tmp/dsmesock connect/accept and I/O\n",
+    QEMU_ARCH_ALL)
+SRST
+``-user-trace-dsmesock``
+    From boot, watch ``bind``/``connect``/``accept`` on Unix sockets whose
+    path contains ``dsmesock``. In the sock window, log ``read``/``write``
+    (and ``poll``/``select``) on those fds with payload and virtual time.
+ERST
+
+DEF("user-trace-sock-window", HAS_ARG, QEMU_OPTION_user_trace_sock_window, \
+    "-user-trace-sock-window start,end  virtual-second window for dsmesock I/O\n",
+    QEMU_ARCH_ALL)
+SRST
+``-user-trace-sock-window start,end``
+    Restrict dsmesock payload dumps and BME PC samples to this inclusive
+    virtual-second range. Connection tracking itself is not windowed.
+ERST
+
+DEF("user-trace-sock-bytes", HAS_ARG, QEMU_OPTION_user_trace_sock_bytes, \
+    "-user-trace-sock-bytes N       bytes of dsmesock payload to copy (default 64)\n",
+    QEMU_ARCH_ALL)
+SRST
+``-user-trace-sock-bytes N``
+    Copy at most this many payload bytes from a tracked dsmesock
+    ``read``/``write``. Default 64, maximum 64.
+ERST
+
+DEF("user-trace-bme-syscalls", 0, QEMU_OPTION_user_trace_bme_syscalls, \
+    "-user-trace-bme-syscalls       log every BME syscall in the syscall window\n",
+    QEMU_ARCH_ALL)
+SRST
+``-user-trace-bme-syscalls``
+    After ``execve`` of ``bme_RX-44``, log every EL0 syscall from that
+    TTBR0 inside ``-user-trace-syscall-window``, including duration.
+ERST
+
+DEF("user-trace-sample-ms", HAS_ARG, QEMU_OPTION_user_trace_sample_ms, \
+    "-user-trace-sample-ms N        sample BME PC every N virtual milliseconds\n",
+    QEMU_ARCH_ALL)
+SRST
+``-user-trace-sample-ms N``
+    While BME is known and the sock window is open, sample the CPU every
+    N virtual milliseconds. Distinguishes a userspace loop from a kernel
+    wait or another process running.
+ERST
+
+DEF("user-trace-quit-sec", HAS_ARG, QEMU_OPTION_user_trace_quit_sec, \
+    "-user-trace-quit-sec N         dump BME thread/fd state and quit at virtual second N\n",
+    QEMU_ARCH_ALL)
+SRST
+``-user-trace-quit-sec N``
+    At virtual second N-1 dump BME's outstanding syscalls, threads, and
+    fd table. At second N dump again and request a host-side QEMU quit.
+    Guest and device state are not changed before the quit.
 ERST
 
 DEF("dfilter", HAS_ARG, QEMU_OPTION_DFILTER, \

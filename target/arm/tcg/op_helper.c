@@ -25,6 +25,9 @@
 #include "exec/exec-all.h"
 #include "exec/cpu_ldst.h"
 #include "cpregs.h"
+#ifndef CONFIG_USER_ONLY
+#include "qemu/user-trace-pc.h"
+#endif
 
 #define SIGNBIT (uint32_t)0x80000000
 #define SIGNBIT64 ((uint64_t)1 << 63)
@@ -550,6 +553,14 @@ void HELPER(cpsr_write_eret)(CPUARMState *env, uint32_t val)
      */
     env->regs[15] &= (env->thumb ? ~1 : ~3);
     arm_rebuild_hflags(env);
+
+#ifndef CONFIG_USER_ONLY
+    if (user_trace_syscall_enabled() && arm_current_el(env) == 0) {
+        user_trace_svc_arm_eret(env->regs[15], env->regs[0],
+                                env->cp15.ttbr0_el[1],
+                                extract32(env->cp15.contextidr_el[1], 0, 8));
+    }
+#endif
 
     bql_lock();
     arm_call_el_change_hook(env_archcpu(env));

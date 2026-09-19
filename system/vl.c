@@ -3077,8 +3077,41 @@ void qemu_init(int argc, char **argv)
             case QEMU_OPTION_user_trace_syscall:
                 user_trace_syscall_parse(optarg);
                 break;
+            case QEMU_OPTION_user_trace_syscall_window:
+                user_trace_syscall_window_parse(optarg);
+                break;
+            case QEMU_OPTION_user_trace_syscall_global:
+                user_trace_syscall_global_set(true);
+                break;
+            case QEMU_OPTION_user_trace_proc:
+                user_trace_proc_set(true);
+                break;
+            case QEMU_OPTION_user_trace_write_name:
+                user_trace_write_name_parse(optarg);
+                break;
+            case QEMU_OPTION_user_trace_write_window:
+                user_trace_write_window_parse(optarg);
+                break;
             case QEMU_OPTION_user_trace_mem_times:
                 user_trace_mem_times_parse(optarg);
+                break;
+            case QEMU_OPTION_user_trace_dsmesock:
+                user_trace_dsmesock_set(true);
+                break;
+            case QEMU_OPTION_user_trace_sock_window:
+                user_trace_sock_window_parse(optarg);
+                break;
+            case QEMU_OPTION_user_trace_sock_bytes:
+                user_trace_sock_bytes_parse(optarg);
+                break;
+            case QEMU_OPTION_user_trace_bme_syscalls:
+                user_trace_bme_syscalls_set(true);
+                break;
+            case QEMU_OPTION_user_trace_sample_ms:
+                user_trace_sample_ms_parse(optarg);
+                break;
+            case QEMU_OPTION_user_trace_quit_sec:
+                user_trace_quit_sec_parse(optarg);
                 break;
             case QEMU_OPTION_D:
                 log_file = optarg;

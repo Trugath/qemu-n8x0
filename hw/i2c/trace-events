@@ -27,7 +27,7 @@ allwinner_i2c_read(const char* reg_name, uint64_t offset, uint64_t value) "read 
 allwinner_i2c_write(const char* reg_name, uint64_t offset, uint64_t value) "write %s [0x%" PRIx64 "]: <- 0x%" PRIx64
 
 # omap_i2c.c
-omap_i2c_start(uint16_t address, bool receive, uint16_t count, bool stop) "address=0x%02x receive=%d count=%u stop=%d"
+omap_i2c_start(uint16_t address, bool receive, uint16_t count, bool stop, int nack) "address=0x%02x receive=%d count=%u stop=%d nack=%d"
 omap_i2c_data(uint16_t address, bool receive, uint8_t value) "address=0x%02x receive=%d value=0x%02x"
 omap_i2c_irq(uint16_t status, uint8_t mask, int level) "status=0x%04x mask=0x%02x level=%d"
 

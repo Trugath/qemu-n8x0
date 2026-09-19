@@ -44,6 +44,7 @@ struct omap_mcspi_s {
         qemu_irq txdrq;
         qemu_irq rxdrq;
         uint32_t (*txrx)(void *opaque, uint32_t, int);
+        void (*setcs)(void *opaque, int selected);
         void *opaque;
 
         uint32_t tx;
@@ -148,7 +149,7 @@ static uint64_t omap_mcspi_read(void *opaque, hwaddr addr, unsigned size)
     int ch = 0;
     uint32_t ret;
 
-    if (size != 4) {
+    if (size != 1 && size != 2 && size != 4) {
         return omap_badwidth_read32(opaque, addr);
     }
 
@@ -222,6 +223,7 @@ static uint64_t omap_mcspi_read(void *opaque, hwaddr addr, unsigned size)
     case 0x3c:	/* MCSPI_RX */
         s->ch[ch].status &= ~(1 << 0);			/* RXS */
         ret = s->ch[ch].rx;
+        omap_mcspi_dmarequest_update(s->ch + ch);
         omap_mcspi_transfer_run(s, ch);
         return ret;
     }
@@ -236,10 +238,16 @@ static void omap_mcspi_write(void *opaque, hwaddr addr,
     struct omap_mcspi_s *s = opaque;
     int ch = 0;
 
-    if (size != 4) {
+    /*
+     * sDMA for 16-bit SPI words hits TX/RX with size=2. Accept 1/2/4 and
+     * ignore high bytes; rejecting non-32-bit accesses sent the write through
+     * omap_badwidth_write32 which never cleared TXS for the DMA engine.
+     */
+    if (size != 1 && size != 2 && size != 4) {
         omap_badwidth_write32(opaque, addr, value);
         return;
     }
+    value &= (size == 1) ? 0xff : (size == 2) ? 0xffff : 0xffffffff;
 
     switch (addr) {
     case 0x00:	/* MCSPI_REVISION */
@@ -313,6 +321,10 @@ static void omap_mcspi_write(void *opaque, hwaddr addr,
                           "%s: invalid WL value (%" PRIx64 ")\n",
                           __func__, (value >> 7) & 0x1f);
         }
+        if (((value ^ s->ch[ch].config) & (1 << 20)) && /* FORCE */
+            s->ch[ch].setcs) {
+            s->ch[ch].setcs(s->ch[ch].opaque, !!(value & (1 << 20)));
+        }
         s->ch[ch].config = value & 0x7fffff;
         break;
 
@@ -342,6 +354,13 @@ static void omap_mcspi_write(void *opaque, hwaddr addr,
     case 0x38:	/* MCSPI_TX */
         s->ch[ch].tx = value;
         s->ch[ch].status &= ~(1 << 1);			/* TXS */
+        /*
+         * Drop the TX DMA request while TXS is clear so the next TXS
+         * rising edge can re-arm element-synced sDMA. Without this pulse,
+         * level-triggered DRQs stay asserted and firmware uploads hang
+         * after the first SPI word (cx3110x 3826.arm).
+         */
+        omap_mcspi_dmarequest_update(s->ch + ch);
         omap_mcspi_transfer_run(s, ch);
         break;
 
@@ -383,9 +402,18 @@ void omap_mcspi_attach(struct omap_mcspi_s *s,
                 uint32_t (*txrx)(void *opaque, uint32_t, int), void *opaque,
                 int chipselect)
 {
+    omap_mcspi_attach_full(s, txrx, NULL, opaque, chipselect);
+}
+
+void omap_mcspi_attach_full(struct omap_mcspi_s *s,
+                uint32_t (*txrx)(void *opaque, uint32_t, int),
+                void (*setcs)(void *opaque, int selected),
+                void *opaque, int chipselect)
+{
     if (chipselect < 0 || chipselect >= s->chnum)
         hw_error("%s: Bad chipselect %i\n", __func__, chipselect);
 
     s->ch[chipselect].txrx = txrx;
+    s->ch[chipselect].setcs = setcs;
     s->ch[chipselect].opaque = opaque;
 }

@@ -105,6 +105,7 @@ SerialMM *serial_mm_init(MemoryRegion *address_space,
                          hwaddr base, int regshift,
                          qemu_irq irq, int baudbase,
                          Chardev *chr, enum device_endian end);
+void serial_mm_set_chardev(SerialMM *smm, Chardev *chr);
 
 /* serial-isa.c */
 

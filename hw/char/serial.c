@@ -1121,6 +1121,17 @@ static const TypeInfo serial_mm_info = {
     .instance_size = sizeof(SerialMM),
 };
 
+void serial_mm_set_chardev(SerialMM *smm, Chardev *chr)
+{
+    SerialState *s = &smm->serial;
+
+    qemu_chr_fe_deinit(&s->chr, false);
+    if (!qemu_chr_fe_init(&s->chr, chr, &error_fatal)) {
+        return;
+    }
+    serial_be_change(s);
+}
+
 static void serial_register_types(void)
 {
     type_register_static(&serial_info);

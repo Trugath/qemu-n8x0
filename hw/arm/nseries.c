@@ -38,7 +38,10 @@
 #include "hw/input/lm832x.h"
 #include "hw/input/tsc2xxx.h"
 #include "hw/misc/cbus.h"
+#include "hw/ssi/cx3110x.h"
+#include "hw/char/csr41814.h"
 #include "hw/sensor/tmp105.h"
+#include "hw/audio/tlv320aic33.h"
 #include "hw/qdev-properties.h"
 #include "hw/block/flash.h"
 #include "hw/hw.h"
@@ -146,6 +149,22 @@ static void n800_mmc_cs_cb(void *opaque, int line, int level)
     omap_mmc_enable((struct omap_mmc_s *) opaque, !level);
 }
 
+static void n8x0_bt_setup(struct n800_s *s)
+{
+    Chardev *radio = uart_csr41814_init();
+
+    /*
+     * Reset is active-low. hci_h4p drives reset low, wake high, then
+     * reset high, and waits for CTS before RTS. Both pins high enables
+     * the H4+ parser.
+     */
+    qdev_connect_gpio_out(s->mpu->gpio, N8X0_BT_RESET_GPIO,
+                          csr41814_pins_get(radio)[CSR41814_PIN_RESET]);
+    qdev_connect_gpio_out(s->mpu->gpio, N8X0_BT_WKUP_GPIO,
+                          csr41814_pins_get(radio)[CSR41814_PIN_WAKEUP]);
+    omap_uart_attach(s->mpu->uart[BT_UART], radio);
+}
+
 static void n8x0_gpio_setup(struct n800_s *s)
 {
     qdev_connect_gpio_out(s->mpu->gpio, N8X0_MMC_CS_GPIO,
@@ -217,7 +236,7 @@ static Notifier n8x0_system_powerdown_notifier = {
     .notify = n8x0_powerdown_req
 };
 
-static void n8x0_i2c_setup(struct n800_s *s)
+static void n8x0_i2c_setup(struct n800_s *s, int model)
 {
     DeviceState *dev;
     qemu_irq tmp_irq = qdev_get_gpio_in(s->mpu->gpio, N8X0_TMP105_GPIO);
@@ -235,6 +254,21 @@ static void n8x0_i2c_setup(struct n800_s *s)
     /* Attach a TMP105 PM chip (A0 wired to ground) */
     dev = DEVICE(i2c_slave_create_simple(i2c, TYPE_TMP105, N8X0_TMP105_ADDR));
     qdev_connect_gpio_out(dev, 0, tmp_irq);
+
+    /*
+     * N810 TLV320AIC33 control is I2C2 @ 0x18 (Linux adapter 2 /
+     * tlv320aic3x-codec.2-0018, DTS &i2c2). RESETB is GPIO 118
+     * active-low. Digital audio is still DSP-side; this is the
+     * ARM-visible control plane only.
+     */
+    if (model == 810) {
+        I2CBus *i2c2 = omap_i2c_bus(s->mpu->i2c[1]);
+
+        dev = DEVICE(i2c_slave_create_simple(i2c2, TYPE_TLV320AIC33,
+                                           N810_TLV320AIC33_ADDR));
+        qdev_connect_gpio_out(s->mpu->gpio, N810_AIC33_RESET_GPIO,
+                               qdev_get_gpio_in(dev, 0));
+    }
 }
 
 /* Touchscreen and keypad controller */
@@ -325,19 +359,60 @@ static void n810_tsc_setup(struct n800_s *s)
 }
 
 /* N810 Keyboard controller */
+#define N810_FN_MATRIX		0x2b
+
+/*
+ * RX-44 has no number row: XKB level-3 (Fn) on Q..P yields 1..9,0
+ * (nokia_vndr/rx-44). Map host top-row digits to that chord so date
+ * dialogs are usable from a PC keyboard.
+ */
+static const struct {
+    uint8_t host;   /* PC set-1 scancode */
+    uint8_t letter; /* LM8323 matrix code for Q..P */
+} n810_digit_keys[] = {
+    { 0x02, 0x01 }, /* 1 -> Q */
+    { 0x03, 0x11 }, /* 2 -> W */
+    { 0x04, 0x21 }, /* 3 -> E */
+    { 0x05, 0x31 }, /* 4 -> R */
+    { 0x06, 0x41 }, /* 5 -> T */
+    { 0x07, 0x51 }, /* 6 -> Y */
+    { 0x08, 0x61 }, /* 7 -> U */
+    { 0x09, 0x71 }, /* 8 -> I */
+    { 0x0a, 0x03 }, /* 9 -> O */
+    { 0x0b, 0x04 }, /* 0 -> P */
+};
+
 static void n810_key_event(void *opaque, int keycode)
 {
     struct n800_s *s = (struct n800_s *) opaque;
-    int code = s->keymap[keycode & 0x7f];
+    int raw = keycode & 0x7f;
+    int down = !(keycode & 0x80);
+    int code;
+    size_t i;
+
+    for (i = 0; i < ARRAY_SIZE(n810_digit_keys); i++) {
+        if (raw == n810_digit_keys[i].host) {
+            if (down) {
+                lm832x_key_event(s->kbd, N810_FN_MATRIX, 1);
+                lm832x_key_event(s->kbd, n810_digit_keys[i].letter, 1);
+            } else {
+                lm832x_key_event(s->kbd, n810_digit_keys[i].letter, 0);
+                lm832x_key_event(s->kbd, N810_FN_MATRIX, 0);
+            }
+            return;
+        }
+    }
+
+    code = s->keymap[raw];
 
     if (code == -1) {
-        if ((keycode & 0x7f) == RETU_KEYCODE) {
-            retu_key_event(s->retu, !(keycode & 0x80));
+        if (raw == RETU_KEYCODE) {
+            retu_key_event(s->retu, down);
         }
         return;
     }
 
-    lm832x_key_event(s->kbd, code, !(keycode & 0x80));
+    lm832x_key_event(s->kbd, code, down);
 }
 
 #define M	0
@@ -732,9 +807,21 @@ static void n8x0_spi_setup(struct n800_s *s)
 {
     void *tsc = s->ts.opaque;
     void *mipid = mipid_init();
+    struct cx3110x_s *wlan;
+    qemu_irq wlan_irq;
 
     omap_mcspi_attach(s->mpu->mcspi[0], s->ts.txrx, tsc, 0);
     omap_mcspi_attach(s->mpu->mcspi[0], mipid_txrx, mipid, 1);
+
+    /*
+     * CX3110x / STLC4550 on McSPI2 CS0 (OMAP_TAG_WLAN_CX3110X): IRQ GPIO 87,
+     * power GPIO 97. Stub answers HOST_ALLOWED / RAM_BOOT READY so SoftMAC
+     * firmware upload can finish; LMAC scan is not modeled yet.
+     */
+    wlan_irq = qdev_get_gpio_in(s->mpu->gpio, N8X0_WLAN_IRQ_GPIO);
+    wlan = cx3110x_init(wlan_irq);
+    omap_mcspi_attach_full(s->mpu->mcspi[1], cx3110x_txrx, cx3110x_setcs,
+                           wlan, 0);
 }
 
 /* This task is normally performed by the bootloader.  If we're loading
@@ -1400,25 +1487,25 @@ static void n8x0_init(MachineState *machine,
      * (spi bus 2)
      *   Conexant cx3110x (WLAN)
      *   optional: pc2400m (WiMAX)
-     * (i2c bus 0)
-     *   TLV320AIC33 (audio codec)
+     * (i2c bus 0 / I2C1)
      *   TCM825x (camera by Toshiba)
      *   lp5521 (clever LEDs)
      *   tsl2563 (light sensor, hwmon, model 7, rev. 0)
      *   lm8323 (keypad, manf 00, rev 04)
-     * (i2c bus 1)
-     *   tmp105 (temperature sensor, hwmon)
-     *   menelaus (pm)
+     *   tmp105, menelaus (wired here; Maemo finds them)
+     * (i2c bus 1 / I2C2 @ 0x48072000)
+     *   TLV320AIC33 @ 0x18, RESETB = GPIO 118 active-low
      * (somewhere on i2c - maybe N800-only)
      *   tea5761 (FM tuner)
-     * (serial 0)
+     * (serial 0 / UART1)
+     *   CSR41814 Bluetooth (H4+), reset GPIO 92, wake GPIO 61
+     * (serial 1)
      *   GPS
-     * (some serial port)
-     *   csr41814 (Bluetooth)
      */
     n8x0_gpio_setup(s);
+    n8x0_bt_setup(s);
     n8x0_nand_setup(s, model);
-    n8x0_i2c_setup(s);
+    n8x0_i2c_setup(s, model);
     if (model == 800) {
         n800_tsc_kbd_setup(s);
     } else if (model == 810) {
