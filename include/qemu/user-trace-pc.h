@@ -40,6 +40,7 @@ bool user_trace_syscall_should_log(uint32_t nr, uint64_t ttbr0, uint32_t asid,
                                    uint32_t r0);
 bool user_trace_syscall_is_write(uint32_t nr);
 bool user_trace_syscall_is_read(uint32_t nr);
+const char *user_trace_fd_path(uint64_t ttbr0, uint32_t fd);
 bool user_trace_dsmesock_enabled(void);
 bool user_trace_in_sock_window(void);
 unsigned user_trace_sock_bytes(void);
@@ -86,6 +87,7 @@ void user_trace_svc_arm_enter(uint32_t pc, uint32_t retpc, uint32_t lr,
                               uint64_t ttbr0, uint32_t asid, uint32_t tls,
                               const char *extra);
 void user_trace_svc_arm_leave(uint32_t pc, uint32_t r0);
+uint32_t user_trace_arch_copy(uint32_t addr, void *buf, uint32_t len);
 void user_trace_svc_arm_eret(uint32_t pc, uint32_t r0, uint64_t ttbr0,
                              uint32_t asid);
 void user_trace_note_brk(uint32_t value);

@@ -2274,10 +2274,10 @@ size_t audio_rate_peek_bytes(RateCtl *rate, struct audio_pcm_info *info)
     ticks = now - rate->start_ticks;
     bytes = muldiv64(ticks, info->bytes_per_second, NANOSECONDS_PER_SECOND);
     frames = (bytes - rate->bytes_sent) / info->bytes_per_frame;
-    if (frames < 0 || frames > 65536) {
+    if (frames < 0 || frames > 262144) {
         AUD_log(NULL, "Resetting rate control (%" PRId64 " frames)\n", frames);
         audio_rate_start(rate);
-        frames = 0;
+        frames = frames > 262144 ? 262144 : 0;
     }
 
     return frames * info->bytes_per_frame;

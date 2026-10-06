@@ -597,6 +597,29 @@ void *retu_init(qemu_irq irq, int vilma)
     return &s->cbus;
 }
 
+/*
+ * Idle RX-34 (battery in, charger not claimed) from n8x0-hwtest
+ * goldens/rx34 captured 2026-09-23. n810 keeps the RX-44 reset above.
+ */
+void retu_apply_rx34_idle(void *retu)
+{
+    CBusSlave *slave = (CBusSlave *) retu;
+    CBusRetu *s = (CBusRetu *) slave->opaque;
+
+    s->status = 0x4920;
+    s->cc[1] = 0x0011;
+    s->irqen = 0xfffe;
+    s->result[retu_adc_bsi] = 0x3b9;
+    s->result[retu_adc_batt_temp] = 0x11b;
+    s->result[retu_adc_chg_volt] = 0;
+    s->result[retu_adc_head_det] = 0x3ff;
+    s->result[retu_adc_hook_det] = 0x073;
+    s->result[retu_adc_batt_volt] = 0x1b5;
+    s->result[retu_adc_bbatt_volt] = 0x39f;
+    s->result[retu_adc_self_temp] = 0x341;
+    retu_interrupt_update(s);
+}
+
 void retu_key_event(void *retu, int state)
 {
     CBusSlave *slave = (CBusSlave *) retu;
@@ -897,4 +920,14 @@ void *tahvo_init(qemu_irq irq, int betty)
     s->cbus.addr = 2;
 
     return &s->cbus;
+}
+
+/* RX-34 idle IMR from the same n8x0-hwtest capture. Current stays 0. */
+void tahvo_apply_rx34_idle(void *tahvo)
+{
+    CBusSlave *slave = (CBusSlave *) tahvo;
+    CBusTahvo *s = (CBusTahvo *) slave->opaque;
+
+    s->irqen = 0x00ff;
+    tahvo_interrupt_update(s);
 }

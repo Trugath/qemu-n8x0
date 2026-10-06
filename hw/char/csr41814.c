@@ -9,8 +9,9 @@
  *
  * Packet framing follows QEMU 4.2 hw/bt/hci-csr.c. Vendor 0xfc00 is one
  * byte longer than the HCI length and then rounded up to an even size.
- * The last bc4fw.bin command is four bytes short of that; hci_h4p does
- * not wait for its reply, and the following alive retry absorbs it.
+ * The last bc4fw.bin command is four bytes short of that; do not wait
+ * for those bytes or the following HCI command is swallowed and the
+ * startup wizard's phone scan never finishes.
  */
 
 #include "qemu/osdep.h"
@@ -67,6 +68,10 @@ typedef struct Csr41814State {
     bool logged_neg;
     bool logged_fw;
     bool logged_reset;
+    int flushing;
+    /* Completed 0xfc00 commands since the last reset. bc4fw.bin's last
+     * command is four bytes shorter than the H4+ length rule. */
+    int fw_cmds;
 } Csr41814State;
 
 static const uint8_t csr_neg_packet[] = {
@@ -75,18 +80,68 @@ static const uint8_t csr_neg_packet[] = {
     0x4c, 0x00, 0x96, 0x00, 0x00,
 };
 
+/*
+ * Last bc4fw.bin command. HCI length says 20 data bytes; the file has 16.
+ * Waiting for the missing four swallows the next HCI command (Read Local
+ * Name is four bytes) and the phone wizard times out.
+ */
+static const uint8_t csr_short_fw[] = {
+    0x01, 0x00, 0xfc, 0x13, 0xc2, 0x02, 0x00, 0x09,
+    0x00, 0x00, 0x00, 0x02, 0x40, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,
+};
+
 /* 2.0+EDR feature page, no LE. */
 static const uint8_t csr_features[8] = {
     0xff, 0xff, 0x8d, 0xfe, 0x9b, 0xf9, 0x00, 0x80,
 };
 
-static void csr_kick(Csr41814State *s)
+static void csr_out_tick(void *opaque);
+
+/*
+ * Push every queued byte the UART FIFO will take before returning to
+ * the guest. A baud timer used to hold the first byte; hci_h4p's GPIO
+ * reset (128 jiffies) then cleared the queue and Read Local Name timed
+ * out. Retry in 1 ns if the FIFO is still full so the rest follows as
+ * soon as the guest drains it.
+ */
+static void csr_flush(Csr41814State *s)
 {
-    if (!s->enable || !s->out_len || timer_pending(s->out_tm)) {
+    Chardev *chr = CHARDEV(s);
+    int room, n;
+
+    if (s->flushing || !s->enable || !s->out_len) {
         return;
     }
-    timer_mod(s->out_tm,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->baud_delay);
+    s->flushing = 1;
+    timer_del(s->out_tm);
+    /*
+     * One UART-FIFO chunk per tick. Dumping a 256-byte Read Local Name
+     * in a single be_write overflows the OMAP RX FIFO and desyncs H4+,
+     * which shows up as hcid EIO before any firmware command is parsed.
+     * 16 bytes at the 50 µs cap still finishes a name reply in under 1 ms,
+     * inside the 128-jiffy HCI timeout and before GPIO reset.
+     */
+    room = qemu_chr_be_can_write(chr);
+    n = room < 16 ? room : 16;
+    if (n > s->out_len) {
+        n = s->out_len;
+    }
+    if (n > 0) {
+        qemu_chr_be_write(chr, s->out, n);
+        s->out_len -= n;
+        memmove(s->out, s->out + n, s->out_len);
+    }
+    if (s->out_len) {
+        timer_mod(s->out_tm,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->baud_delay);
+    }
+    s->flushing = 0;
+}
+
+static void csr_kick(Csr41814State *s)
+{
+    csr_flush(s);
 }
 
 static void csr_queue(Csr41814State *s, const uint8_t *bytes, int len)
@@ -159,7 +214,8 @@ static void csr_reset_chip(Csr41814State *s)
     csr_ready(s);
     s->enable = 0;
     s->scan_enable = 0;
-    s->baud_delay = NANOSECONDS_PER_SECOND / 9600;
+    s->fw_cmds = 0;
+    s->baud_delay = 50000;
     s->modem_state = CHR_TIOCM_CTS | CHR_TIOCM_DSR | CHR_TIOCM_CAR;
 }
 
@@ -185,6 +241,7 @@ static void csr_vendor(Csr41814State *s, uint16_t ocf,
         s->bd_addr[5] = data[offset + 2];
     }
 
+    s->fw_cmds++;
     if (!s->logged_fw) {
         s->logged_fw = true;
         info_report("csr41814: BC4 firmware command");
@@ -212,6 +269,7 @@ static void csr_hci_cmd(Csr41814State *s, uint16_t opcode,
     /* Link control uses Command Status, then a later event or nothing. */
     if (ogf == 0x01) {
         if (opcode == 0x0401) {
+            info_report("csr41814: Inquiry");
             csr_cmd_status(s, opcode, 0x00);
             ret[0] = 0x00;
             csr_queue_evt(s, 0x01, ret, 1);
@@ -236,6 +294,7 @@ static void csr_hci_cmd(Csr41814State *s, uint16_t opcode,
         }
         break;
     case 0x0c14: /* Read Local Name */
+        info_report("csr41814: Read Local Name");
         ret[0] = 0x00;
         memcpy(ret + 1, s->loc_name, 248);
         csr_cmd_complete(s, opcode, ret, 249);
@@ -432,12 +491,36 @@ static int csr_write(Chardev *chr, const uint8_t *buf, int len)
         int cnt = MIN(len, s->in_needed - s->in_len);
         int hdr;
 
+        /* Stop at the truncated firmware word so its tail is not the
+         * next HCI command. If these 20 bytes are not that word, the
+         * next iteration reads the rest of in_needed. */
+        if (s->in_state == CSR_DATA &&
+            s->in_needed > (int)sizeof(csr_short_fw) &&
+            s->in_len < (int)sizeof(csr_short_fw)) {
+            int room = sizeof(csr_short_fw) - s->in_len;
+
+            if (cnt > room) {
+                cnt = room;
+            }
+        }
+
         if (cnt > 0) {
             memcpy(s->inpkt + s->in_len, buf, cnt);
             s->in_len += cnt;
             buf += cnt;
             len -= cnt;
             total += cnt;
+        }
+        /*
+         * The truncated firmware word is exactly csr_short_fw. Finish it
+         * here even if the H4+ length rule still wants four more bytes.
+         */
+        if (s->in_state == CSR_DATA &&
+            s->in_len >= (int)sizeof(csr_short_fw) &&
+            s->in_needed > (int)sizeof(csr_short_fw) &&
+            !memcmp(s->inpkt, csr_short_fw, sizeof(csr_short_fw))) {
+            s->in_needed = sizeof(csr_short_fw);
+            info_report("csr41814: short firmware command");
         }
         if (s->in_len < s->in_needed) {
             break;
@@ -457,7 +540,21 @@ static int csr_write(Chardev *chr, const uint8_t *buf, int len)
             continue;
         }
         if (s->in_state == CSR_DATA_LEN) {
-            s->in_needed += csr_data_len(s->inpkt);
+            int dlen = csr_data_len(s->inpkt);
+
+            /*
+             * bc4fw.bin packet 37 (the last 0xfc00, HCI length 0x13)
+             * is four bytes shorter than (len + 1) & ~1. Waiting for
+             * those bytes eats the next alive or HCI command, and
+             * BlueZ then times out Read Local Name. The phone wizard
+             * sits on that timeout.
+             */
+            if (s->inpkt[0] == H4_CMD_PKT &&
+                lduw_le_p(s->inpkt + 1) == 0xfc00 &&
+                s->inpkt[3] == 0x13 && s->fw_cmds == 36 && dlen >= 4) {
+                dlen -= 4;
+            }
+            s->in_needed += dlen;
             if (s->in_needed > (int)sizeof(s->inpkt)) {
                 error_report("csr41814: packet too long");
                 csr_ready(s);
@@ -474,24 +571,12 @@ static int csr_write(Chardev *chr, const uint8_t *buf, int len)
 
 static void csr_out_tick(void *opaque)
 {
-    Csr41814State *s = opaque;
-    Chardev *chr = CHARDEV(s);
+    csr_flush(opaque);
+}
 
-    if (!s->enable || !s->out_len) {
-        return;
-    }
-    if (!qemu_chr_be_can_write(chr)) {
-        timer_mod(s->out_tm,
-                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->baud_delay);
-        return;
-    }
-    qemu_chr_be_write(chr, s->out, 1);
-    s->out_len--;
-    memmove(s->out, s->out + 1, s->out_len);
-    if (s->out_len) {
-        timer_mod(s->out_tm,
-                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->baud_delay);
-    }
+static void csr_accept_input(Chardev *chr)
+{
+    csr_flush(CSR41814(chr));
 }
 
 static int csr_ioctl(Chardev *chr, int cmd, void *arg)
@@ -508,6 +593,11 @@ static int csr_ioctl(Chardev *chr, int cmd, void *arg)
         }
         if (s->baud_delay < 1) {
             s->baud_delay = 1;
+        }
+        /* 128-jiffy HCI timeout is 1s. A 256-byte reply must finish well
+         * inside that even when the divisor is still the reset default. */
+        if (s->baud_delay > 50000) {
+            s->baud_delay = 50000;
         }
         /* hci_h4p waits for CTS after every speed change. */
         s->modem_state |= CHR_TIOCM_CTS;
@@ -591,6 +681,7 @@ static void csr_class_init(ObjectClass *oc, void *data)
     cc->open = csr_open;
     cc->chr_write = csr_write;
     cc->chr_ioctl = csr_ioctl;
+    cc->chr_accept_input = csr_accept_input;
     (void)data;
 }
 

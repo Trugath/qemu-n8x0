@@ -16,6 +16,20 @@ static uint8_t eapq_flow;
 static uint8_t eapq_parked4;
 static void eapq_note_mmio(C55xCPU *cpu, uint32_t word, uint16_t value);
 static void eapq_note_call(C55xCPU *cpu, uint32_t from, uint32_t dest);
+static void eap_note_cssa(C55xCPU *cpu);
+static void eap_pcm_stat(const char *fmt, ...)
+    __attribute__((format(gnu_printf, 1, 2)));
+static uint32_t eap_cssa_src;
+/* *AR6 in _SRC_TII_convert: shared output budget. */
+static uint32_t src_budget_word;
+/* Output pointer at SRC entry; the RET scan is the buffer IODMA reads. */
+static uint32_t src_out_base;
+static uint16_t src_out_n;
+static int src_out_armed;
+/* Set once the submix slot at word 0x5d2 holds a real sample. */
+static int mix_slot_hot;
+static int swap_seen;
+static uint16_t eap_cssa_len;
 static void eapq_note_irq(C55xCPU *cpu, unsigned bit);
 static void eapq_note_bcc(C55xCPU *cpu, uint32_t from, uint32_t dest,
                          int taken);
@@ -122,20 +136,20 @@ static uint32_t xar_plus(uint32_t xar, int32_t delta)
 static uint16_t pkt_read_st2(const C55xCPU *cpu);
 
 /*
- * SPRU371F circular addressing: ARnLC/CDPLC selects BSA+index, size
- * BK+1. ARn is the 16-bit index (MOV #0,AR3 then *AR3); XARn[22:16]
- * stay the page. _SRC_TII_asmDoubleStageConvert ORs ST2 #0x0138
- * (AR3LC|AR4LC|AR5LC), loads BSA23/BSA45/BSAC and BK03=4095.
+ * SPRU371F 6.11.2: BK is the buffer length. The example loads BK03
+ * with 3 for a 3-word buffer and wraps index 2 back to 0. ARn is
+ * the index (MOV #0,AR3 then *AR3); XARn[22:16] stay the page.
+ * Length 0 is not a buffer. _SRC_TII_asmDoubleStageConvert ORs
+ * ST2 #0x0138 (AR3LC|AR4LC|AR5LC) and loads BK47 with the delay
+ * length. Treating that as length+1 wraps the last delay sample
+ * onto BSA23, and the next AADD uses that sample as a pointer.
  */
 static uint16_t circ_index(uint16_t index, int32_t delta, uint16_t bk)
 {
-    int32_t size = (int32_t)bk + 1;
+    int32_t size = bk ? (int32_t)bk : 65536;
     int32_t v;
 
     v = (int32_t)index + delta;
-    if (size <= 0) {
-        return (uint16_t)v;
-    }
     v %= size;
     if (v < 0) {
         v += size;
@@ -150,6 +164,14 @@ static int ar_circular(const C55xCPU *cpu, unsigned ar)
 
 static uint16_t ar_bk(const C55xCPU *cpu, unsigned ar)
 {
+    /*
+     * SPRU371F 6.11.3: C54CM=1 (silicon reset ST1 0x2920) sizes every
+     * ARn from BK03 and does not consult BK47. AR4 ±1 wrapped when
+     * BK03 was 5 and did not wrap on the BK47 value which=5 stored.
+     */
+    if (cpu->st1 & C55X_ST1_C54CM) {
+        return cpu->bk03;
+    }
     return ((ar & 7) < 4) ? cpu->bk03 : cpu->bk47;
 }
 
@@ -258,6 +280,19 @@ static uint32_t pkt_read_xar(const C55xCPU *cpu, unsigned n)
            C55X_WORD_MASK;
 }
 
+/*
+ * SPRU371F 6.5.3.6 and 6.5.3.8: C54CM=0 uses T0, C54CM=1 uses AR0.
+ * Post-modify adds that value after the access. Indexed *(ARn±T0)
+ * uses it only as the offset and does not write ARn.
+ */
+static int16_t smem_t0_step(const C55xCPU *cpu)
+{
+    if (cpu->st1 & C55X_ST1_C54CM) {
+        return (int16_t)pkt_read_xar(cpu, 0);
+    }
+    return (int16_t)pkt_read_t(cpu, 0);
+}
+
 static uint32_t pkt_read_xsp(const C55xCPU *cpu)
 {
     return (cpu->pkt_src_valid ? cpu->pkt_xsp : cpu->xsp) & C55X_WORD_MASK;
@@ -329,6 +364,89 @@ static int data_word_is_ram(uint32_t word)
     return 1;
 }
 
+/*
+ * pcm1 write-handler (avs 0x124c5c). libesd dsp_init writes cmd 8 and
+ * treats ARM +10 as the stream type (*0x9cf34 at *AR6(short(#5))).
+ * Stock cinit copies *0x9cf34=4, so cmd 8 reports type 4 and ARM
+ * writes cmd 1 then blocking read(10). The cmd-1 fill at 0x125c6a
+ * _bksnds 10 bytes (T1=5) with *AR6(1)=1; libesd then MAP_SHARED
+ * mmaps pcm1 (len=0x2000). 0x125ca0 is CALL #_bksnd || MOV T2,T0 —
+ * restore T0 from T2 before the callee. No FIFO1 POLL.
+ */
+#define PCM1_WORD_MODE       0x09cf34u
+#define PCM1_PC_MODE4        0x125346u
+#define PCM1_PC_CMD1_STAT    0x124d60u
+#define PCM1_PC_CMD1_B       0x124d63u
+#define PCM1_PC_CMD1_SEND10  0x125c9bu
+#define PCM1_PC_BKSND_SYNC   0x1266b3u
+#define PCM1_BID_NULL        0xffffu
+
+static int pcm1_cmd_at_ar6(C55xCPU *cpu)
+{
+    return (int)peek16(cpu, cpu->xar[6] & C55X_WORD_MASK);
+}
+
+static int pcm1_filter_store(C55xCPU *cpu, uint32_t word, uint16_t *value)
+{
+    uint32_t pc = cpu->pc & C55X_PC_MASK;
+
+    word &= C55X_WORD_MASK;
+    if (pc == PCM1_PC_MODE4 && word == PCM1_WORD_MODE && *value == 4) {
+        eap_pcm_stat("pcm1-mode4-hold pc=%06x old=%04x\n",
+                     pc, peek16(cpu, word));
+        return 1;
+    }
+    if (pc == PCM1_PC_CMD1_STAT && *value == 2 &&
+        pcm1_cmd_at_ar6(cpu) == 1) {
+        *value = 1;
+        eap_pcm_stat("pcm1-cmd1-status1 pc=%06x AR6=%06x\n",
+                     pc, cpu->xar[6] & C55X_WORD_MASK);
+    }
+    /*
+     * A2: _bksnd is Gateway BKSND (CMD_H=0x20), not WDSND (0x10).
+     * Fig 2-7 header is count, IPBLINK, ARM lock/sync, DSP lock/sync.
+     * Stock 0x1266b3 writes DSP sync (word 5) = tid and count at
+     * word 0, but leaves IPBLINK (word 1) as leftover. ARM's read
+     * chain follows that next-BID; leftover != 0xffff made cmd2
+     * read(4) wait (line[1]=1 blocked, 20260921T113801Z). Terminate
+     * the link and plant DSP lock = tid. Do not rewrite @0x6 to T0,
+     * copy AR6 into the header, rewrite *line T1=2 to 4, or store
+     * into node 09fd76.
+     */
+    if (pc == PCM1_PC_BKSND_SYNC && cpu->bus.write16 && *value == 2) {
+        uint32_t line = (word - 5u) & C55X_WORD_MASK;
+        uint16_t tid = *value;
+
+        uint32_t pay = (line + 6u) & C55X_WORD_MASK;
+        uint16_t cmd = peek16(cpu, pay);
+        uint16_t st = peek16(cpu, (pay + 1u) & C55X_WORD_MASK);
+
+        cpu->bus.write16(cpu->bus.opaque,
+                         (line + 1u) & C55X_WORD_MASK, PCM1_BID_NULL);
+        cpu->bus.write16(cpu->bus.opaque,
+                         (line + 4u) & C55X_WORD_MASK, tid);
+        /*
+         * A3: libesd checks the halfword at the read buffer +2.
+         * _bksnd can clobber that payload word after the call-site
+         * snapshot. Put status 1 back before the mailbox send.
+         * Do not rewrite BKSND @0x6, *line, or node 09fd76.
+         */
+        if ((cmd == 1u || cmd == 2u || cmd == 7u || cmd == 13u) &&
+            st != 1u) {
+            cpu->bus.write16(cpu->bus.opaque,
+                             (pay + 1u) & C55X_WORD_MASK, 1);
+            eap_pcm_stat("pcm1-bksnd-status1 line=%06x cmd=%04x "
+                         "%04x->0001\n",
+                         line, cmd, st);
+            st = 1;
+        }
+        eap_pcm_stat("pcm1-bksnd-hdr line=%06x link=ffff lock=%04x "
+                     "sync=%04x cnt=%04x cmd=%04x st=%04x\n",
+                     line, tid, tid, peek16(cpu, line), cmd, st);
+    }
+    return 0;
+}
+
 static int pkt_commit(C55xCPU *cpu)
 {
     unsigned i;
@@ -337,17 +455,17 @@ static int pkt_commit(C55xCPU *cpu)
     if (cpu->pkt_src_valid && cpu->bus.write16) {
         for (i = 0; i < cpu->pkt_wr_n; i++) {
             uint32_t word = cpu->pkt_wr_word[i];
+            uint16_t value = cpu->pkt_wr_value[i];
             uint16_t old = 0;
             int watch = data_word_is_ram(word);
 
             if (watch && cpu->bus.read16) {
                 cpu->bus.read16(cpu->bus.opaque, word, &old);
             }
-            if (cpu->bus.write16(cpu->bus.opaque, word,
-                                 cpu->pkt_wr_value[i])) {
+            if (cpu->bus.write16(cpu->bus.opaque, word, value)) {
                 rc = -1;
             } else if (watch) {
-                note_dev_store(cpu, word, old, cpu->pkt_wr_value[i]);
+                note_dev_store(cpu, word, old, value);
                 if ((word & C55X_WORD_MASK) == 0x66bau &&
                     (cpu->pc & C55X_PC_MASK) >= 0x134af3u &&
                     (cpu->pc & C55X_PC_MASK) <= 0x134fdcu) {
@@ -357,14 +475,14 @@ static int pkt_commit(C55xCPU *cpu)
                              "ST2=%04x BSA23=%04x BK03=%04x "
                              "XSP=%06x pkt=1 insn=%llu\n",
                              cpu->pc & C55X_PC_MASK, word & C55X_WORD_MASK,
-                             old, cpu->pkt_wr_value[i],
+                             old, value,
                              cpu->xar[2] & C55X_WORD_MASK, cpu->t[0],
                              cpu->t[1], cpu->st2, cpu->bsa23, cpu->bk03,
                              cpu->xsp & C55X_WORD_MASK,
                              (unsigned long long)cpu->insn_count);
                 }
             } else if (eapq_flow) {
-                eapq_note_mmio(cpu, word, cpu->pkt_wr_value[i]);
+                eapq_note_mmio(cpu, word, value);
             }
         }
     }
@@ -372,11 +490,15 @@ static int pkt_commit(C55xCPU *cpu)
     return rc;
 }
 
+/* One IODMA block: who writes 0007 into the CSSA ping-pong. */
 static int data_write16(C55xCPU *cpu, uint32_t word, uint16_t value)
 {
     uint16_t old = 0;
     int watch;
 
+    if (pcm1_filter_store(cpu, word, &value)) {
+        return 0;
+    }
     if (cpu->pkt_src_valid) {
         if (cpu->pkt_wr_n >= 8) {
             return -1;
@@ -398,6 +520,74 @@ static int data_write16(C55xCPU *cpu, uint32_t word, uint16_t value)
     }
     if (watch) {
         note_dev_store(cpu, word, old, value);
+        if (src_budget_word &&
+            (word & C55X_WORD_MASK) == src_budget_word && old != value) {
+            static unsigned budget_logs;
+
+            if (budget_logs < 24u) {
+                eap_pcm_stat("t=budg pc=%06x %04x->%04x\n",
+                             cpu->pc & C55X_PC_MASK, old, value);
+                budget_logs++;
+            }
+        }
+        /* First loud sample written into the mix buffer the audible
+         * SRC reads (word 0x5d2). Early 0x00e8 fills are the soft
+         * clipper's first bin and are not the tune. */
+        if (((word & C55X_WORD_MASK) == 0xf03bu ||
+             (word & C55X_WORD_MASK) == 0xf05du ||
+             (word & C55X_WORD_MASK) == 0xf0a1u) && old != value) {
+            static unsigned slot_logs;
+
+            if (slot_logs < 16u) {
+                eap_pcm_stat("t=slot pc=%06x w=%06x %04x->%04x\n",
+                             cpu->pc & C55X_PC_MASK, word & C55X_WORD_MASK,
+                             old, value);
+                slot_logs++;
+            }
+        }
+        if ((word & C55X_WORD_MASK) >= 0x218000u &&
+            (word & C55X_WORD_MASK) < 0x218040u && value != 0) {
+            static unsigned zstuff_logs;
+
+            if (zstuff_logs < 8u) {
+                eap_pcm_stat("t=zstuf pc=%06x w=%06x %04x->%04x\n",
+                             cpu->pc & C55X_PC_MASK, word & C55X_WORD_MASK,
+                             old, value);
+                zstuff_logs++;
+            }
+        }
+        if ((word & C55X_WORD_MASK) == 0x5d2u && old != value &&
+            abs((int16_t)value) >= 1000) {
+            static unsigned scratch_logs;
+
+            if ((cpu->pc & C55X_PC_MASK) == 0x133139u) {
+                mix_slot_hot = 1;
+            }
+            if (scratch_logs < 6u) {
+                eap_pcm_stat(
+                    "t=scratch pc=%06x %04x->%04x ac0=%010llx "
+                    "xar0=%06x xar1=%06x xar2=%06x xar3=%06x t0=%04x t1=%04x\n",
+                    cpu->pc & C55X_PC_MASK, old, value,
+                    (unsigned long long)(cpu->ac[0] & C55X_AC_MASK),
+                    cpu->xar[0] & C55X_WORD_MASK,
+                    cpu->xar[1] & C55X_WORD_MASK,
+                    cpu->xar[2] & C55X_WORD_MASK,
+                    cpu->xar[3] & C55X_WORD_MASK,
+                    cpu->t[0], cpu->t[1]);
+                scratch_logs++;
+            }
+        }
+        /* Who clears the mix slot after the loud sample lands. */
+        if ((word & C55X_WORD_MASK) == 0x5d2u &&
+            abs((int16_t)old) >= 1000 && abs((int16_t)value) < 100) {
+            static unsigned clear_logs;
+
+            if (clear_logs < 6u) {
+                eap_pcm_stat("t=clr pc=%06x %04x->%04x\n",
+                             cpu->pc & C55X_PC_MASK, old, value);
+                clear_logs++;
+            }
+        }
         if ((word & C55X_WORD_MASK) == 0x66bau &&
             (cpu->pc & C55X_PC_MASK) >= 0x134af3u &&
             (cpu->pc & C55X_PC_MASK) <= 0x134fdcu) {
@@ -540,7 +730,7 @@ static int resolve_smem(C55xCPU *cpu, const C55xSmem *sm, int mmap, int port,
             case C55X_MOD_K16:
             case C55X_MOD_INDEX_T0:
                 access_off = (sm->mod == C55X_MOD_INDEX_T0) ?
-                             (int16_t)pkt_read_t(cpu, 0) : sm->off;
+                             smem_t0_step(cpu) : sm->off;
                 break;
             case C55X_MOD_INDEX_T1:
                 access_off = (int16_t)pkt_read_t(cpu, 1);
@@ -553,7 +743,7 @@ static int resolve_smem(C55xCPU *cpu, const C55xSmem *sm, int mmap, int port,
                 }
                 break;
             case C55X_MOD_INDEX_MINUS_T0:
-                access_off = -(int16_t)pkt_read_t(cpu, 0);
+                access_off = (int16_t)-smem_t0_step(cpu);
                 break;
             case C55X_MOD_INDEX_MINUS_T1:
                 access_off = -(int16_t)pkt_read_t(cpu, 1);
@@ -565,22 +755,22 @@ static int resolve_smem(C55xCPU *cpu, const C55xSmem *sm, int mmap, int port,
                 *post = -1;
                 break;
             case C55X_MOD_PLUS_T0:
-                *post = (int16_t)pkt_read_t(cpu, 0);
+                *post = smem_t0_step(cpu);
                 break;
             case C55X_MOD_MINUS_T0:
-                *post = -(int16_t)pkt_read_t(cpu, 0);
+                *post = (int16_t)-smem_t0_step(cpu);
                 break;
             case C55X_MOD_PLUS_T1:
                 /*
-                 * Standalone Smem low=0x13 is dis55 *ARn(short(#1)),
-                 * including after BCLR ARMS. mumdrc 134d1c is
-                 * eb7318. Posting by T1=8 walked AR3 from the caller
-                 * scratch (SP+10) onto *SP(#16h) and replaced the
-                 * saved output pointer with 0x6e152f, so the limiter
-                 * dual-MAC circular EA became page 0x6e | BSA01.
+                 * SPRU374 table 6-2 DSP mode (ARMS=0): *ARn+T1 posts
+                 * ARn by T1 after the access. Control mode (ARMS=1)
+                 * already remapped this field to *ARn(short(#1))
+                 * above. Forcing +1 here left SRC's
+                 * 8b534c1270 / bc53 store (BCLR ARMS) writing AR2+1
+                 * every sample without walking the PCM pointer.
                  * 8e||eb Ymem uses C55X_MOD_ARMS_T1, not this case.
                  */
-                access_off = 1;
+                *post = (int16_t)pkt_read_t(cpu, 1);
                 break;
             case C55X_MOD_MINUS_T1:
                 *post = -(int16_t)pkt_read_t(cpu, 1);
@@ -619,13 +809,13 @@ static uint32_t dual_ar_addr(const C55xCPU *cpu, const C55xSmem *sm)
 
     switch (sm->mod) {
     case C55X_MOD_INDEX_T0:
-        idx = (int16_t)pkt_read_t(cpu, 0);
+        idx = smem_t0_step(cpu);
         break;
     case C55X_MOD_INDEX_T1:
         idx = (int16_t)pkt_read_t(cpu, 1);
         break;
     case C55X_MOD_INDEX_MINUS_T0:
-        idx = -(int16_t)pkt_read_t(cpu, 0);
+        idx = (int16_t)-smem_t0_step(cpu);
         break;
     case C55X_MOD_INDEX_MINUS_T1:
         idx = -(int16_t)pkt_read_t(cpu, 1);
@@ -648,10 +838,10 @@ static void dual_ar_commit(C55xCPU *cpu, const C55xSmem *sm, int32_t step)
         delta = -step;
         break;
     case C55X_MOD_PLUS_T0:
-        delta = (int16_t)pkt_read_t(cpu, 0);
+        delta = smem_t0_step(cpu);
         break;
     case C55X_MOD_MINUS_T0:
-        delta = -(int16_t)pkt_read_t(cpu, 0);
+        delta = (int16_t)-smem_t0_step(cpu);
         break;
     case C55X_MOD_PLUS_T1:
         delta = (int16_t)pkt_read_t(cpu, 1);
@@ -857,14 +1047,7 @@ static uint64_t alu40(C55xCPU *cpu, uint64_t a, uint64_t b, int sub,
             result &= C55X_AC_MASK;
         }
     }
-    /*
-     * M40=0: ALU is 32-bit; leave GU clear. Matches silicon mailbox AC
-     * images (low 32 only) and SPRU371 “guard unused in the calculation”.
-     */
-    if (!m40) {
-        result &= 0xffffffffull;
-    }
-    return result;
+    return c55x_ac_store(cpu, result);
 }
 
 static uint64_t mpy16(C55xCPU *cpu, int16_t a, int16_t b, int rnd)
@@ -1724,10 +1907,148 @@ static uint32_t reti_leave(C55xCPU *cpu)
 static void flow_log_branch(C55xCPU *cpu, const char *kind, uint32_t dest)
 {
     uint32_t from = cpu->pc & C55X_PC_MASK;
+    uint32_t d = dest & C55X_PC_MASK;
 
     /* _EAP_sortNetwork spins here (~3e6 identical BCCs). Keep the log. */
     if (from == 0x127fafu || from == 0x128041u) {
         return;
+    }
+    /*
+     * pcm1 write-handler dispatch (avs 0x124c5c): cmd4 unmute/ready at
+     * 0x125941, cmd3 sample write at 0x12536a. Always log these — the
+     * startup jingle never reaches EAC unless cmd3 runs after ready.
+     */
+    if ((d == 0x125941u || d == 0x12536au || d == 0x125a26u ||
+         d == 0x124cdcu) &&
+        from >= 0x124c5cu && from <= 0x124d40u) {
+        uint16_t st = peek16(cpu, cpu->xar[6] & C55X_WORD_MASK);
+        uint16_t st1 = peek16(cpu, (cpu->xar[6] + 1u) & C55X_WORD_MASK);
+        uint16_t line0 = peek16(cpu, cpu->xar[0] & C55X_WORD_MASK);
+
+        c55x_log(cpu,
+                 "pcm1-cmd %s from=%06x dest=%06x XAR0=%06x XAR6=%06x "
+                 "*AR0=%04x *AR6=%04x *AR6+1=%04x T0=%04x T1=%04x "
+                 "insn=%llu\n",
+                 d == 0x125941u ? "cmd4-ready" :
+                 d == 0x12536au ? "cmd3-write" :
+                 d == 0x124cdcu ? "cmd8-info" : "setparams",
+                 from, d,
+                 cpu->xar[0] & C55X_WORD_MASK,
+                 cpu->xar[6] & C55X_WORD_MASK,
+                 line0, st, st1, cpu->t[0], cpu->t[1],
+                 (unsigned long long)cpu->insn_count);
+        eap_pcm_stat("pcm1-cmd %s from=%06x dest=%06x *AR6=%04x w1=%04x\n",
+                     d == 0x125941u ? "cmd4-ready" :
+                     d == 0x12536au ? "cmd3-write" :
+                     d == 0x124cdcu ? "cmd8-info" : "setparams",
+                     from, d, st, st1);
+        if (d == 0x125941u) {
+            cpu->pcm1_cmd4_ready = 1;
+        }
+        if (d == 0x124cdcu) {
+            eap_pcm_stat(
+                "pcm1-cmd8 AR6=%06x cmd=%04x w1=%04x w2=%04x w3=%04x "
+                "w4=%04x w5=%04x cf34=%04x\n",
+                cpu->xar[6] & C55X_WORD_MASK, st, st1,
+                peek16(cpu, (cpu->xar[6] + 2u) & C55X_WORD_MASK),
+                peek16(cpu, (cpu->xar[6] + 3u) & C55X_WORD_MASK),
+                peek16(cpu, (cpu->xar[6] + 4u) & C55X_WORD_MASK),
+                peek16(cpu, (cpu->xar[6] + 5u) & C55X_WORD_MASK),
+                peek16(cpu, PCM1_WORD_MODE));
+        }
+        /*
+         * cmd3 reads samples from fixed word 0x218000 (esd mmap target)
+         * into *09cf22 then SIO_issue. Dump both so a silent EAC path
+         * can be blamed on empty mmap vs stuck DMA ping-pong.
+         */
+        if (d == 0x12536au) {
+            uint32_t src = 0x218000u;
+            /* dbl(*(#09cf22h)): MSW at even word, LSW at odd (A^1). */
+            uint32_t dst = ((uint32_t)peek16(cpu, 0x09cf22u) << 16) |
+                           peek16(cpu, 0x09cf23u);
+            uint16_t s0 = peek16(cpu, src);
+            uint16_t s1 = peek16(cpu, src + 1u);
+            uint16_t s2 = peek16(cpu, src + 2u);
+            uint16_t s3 = peek16(cpu, src + 3u);
+            int smin = 32767, smax = -32768;
+            unsigned si;
+            int16_t sv[4] = {
+                (int16_t)s0, (int16_t)s1, (int16_t)s2, (int16_t)s3
+            };
+
+            for (si = 0; si < 4u; si++) {
+                if (sv[si] < smin) {
+                    smin = sv[si];
+                }
+                if (sv[si] > smax) {
+                    smax = sv[si];
+                }
+            }
+            uint16_t d0 = peek16(cpu, 0x0f60cu); /* CSSA 0x1ec18 word */
+            uint16_t d1 = peek16(cpu, 0x0f60du);
+            uint16_t d2 = peek16(cpu, 0x0f60eu);
+            uint16_t d3 = peek16(cpu, 0x0f60fu);
+
+            c55x_log(cpu,
+                     "pcm1-cmd3-buf dst=%06x src218000=%04x %04x %04x %04x "
+                     "src64min=%d src64max=%d "
+                     "cssa1ec18=%04x %04x %04x %04x cf34=%04x cf2b=%04x "
+                     "insn=%llu\n",
+                     dst & C55X_WORD_MASK, s0, s1, s2, s3, smin, smax,
+                     d0, d1, d2, d3,
+                     peek16(cpu, 0x09cf34u), peek16(cpu, 0x09cf2bu),
+                     (unsigned long long)cpu->insn_count);
+            eap_cssa_src = dst & C55X_WORD_MASK;
+            if (!eap_cssa_len) {
+                eap_cssa_len = 0x800u;
+            }
+            {
+                static unsigned cmd3_logs;
+                int amp = abs(smin) > abs(smax) ? abs(smin) : abs(smax);
+
+                if (cmd3_logs < 8u || amp >= 32) {
+                    eap_pcm_stat(
+                        "t=cmd3 dst=%06x src64min=%d src64max=%d "
+                        "cssa=%04x %04x cf34=%04x cf2b=%04x\n",
+                        dst & C55X_WORD_MASK, smin, smax, d0, d1,
+                        peek16(cpu, 0x09cf34u), peek16(cpu, 0x09cf2bu));
+                    cmd3_logs++;
+                }
+                if (amp >= 200) {
+                    static unsigned mmap_words_logs;
+                    static int mmap_best;
+                    unsigned wi;
+                    char buf[160];
+                    int pos = 0;
+
+                    if (amp > mmap_best && mmap_words_logs < 6u) {
+                        mmap_best = amp;
+                        pos = snprintf(buf, sizeof(buf), "t=mmap dst=%06x",
+                                       dst & C55X_WORD_MASK);
+                        for (wi = 0; wi < 8u && pos > 0 &&
+                             pos < (int)sizeof(buf); wi++) {
+                            int16_t w = (int16_t)peek16(cpu, src + wi);
+
+                            pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
+                                            " %d", (int)w);
+                        }
+                        pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
+                                        " d");
+                        for (wi = 0; wi < 8u && pos > 0 &&
+                             (size_t)pos < sizeof(buf); wi++) {
+                            int16_t w = (int16_t)peek16(cpu, (dst & C55X_WORD_MASK) + wi);
+
+                            pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos,
+                                            " %d", (int)w);
+                        }
+                        if (pos > 0) {
+                            eap_pcm_stat("%s\n", buf);
+                        }
+                        mmap_words_logs++;
+                    }
+                }
+            }
+        }
     }
     if (!(cpu->flow_verbose || pc_is_wild(dest))) {
         return;
@@ -1745,12 +2066,52 @@ static void call_taken(C55xCPU *cpu, uint32_t target, uint32_t ret)
     uint32_t old_reta = cpu->reta & C55X_PC_MASK;
     uint8_t old_cfct = (uint8_t)cpu->cfct;
     uint32_t id;
+    uint32_t from = cpu->pc & C55X_PC_MASK;
+    uint32_t dest = target & C55X_PC_MASK;
 
     call_enter(cpu, ret);
     id = flow_push(cpu, C55X_FLOW_CALL, cpu->pc, ret);
     flow_log_call(cpu, id, cpu->pc, target, ret, old_reta, old_cfct,
                   peek16(cpu, cpu->xsp), peek16(cpu, cpu->xssp));
     eapq_note_call(cpu, cpu->pc, target);
+    /* Ready: CALL _bksnd || MOV #3,T1 — DSP tells ARM to fill mmap.
+     * Apply the parallel mate before the callee runs. */
+    if (from == 0x12597au && dest == 0x126674u) {
+        uint32_t ar6 = cpu->xar[6] & C55X_WORD_MASK;
+
+        cpu->t[1] = 3;
+        eap_pcm_stat(
+            "pcm1-ready-bksnd AR6=%06x *AR6=%04x w1=%04x T0=%04x T1=0003 T2=%04x\n",
+            ar6, peek16(cpu, ar6),
+            peek16(cpu, (ar6 + 1u) & C55X_WORD_MASK),
+            cpu->t[0], cpu->t[2]);
+    }
+    /*
+     * 0x125ca0 is CALL #0x126674 || MOV T2, T0. QEMU takes the CALL
+     * before the parallel MOV, so _bksnd would see leftover T0.
+     * Hardware commits the packet first. Restore T0 from T2 here.
+     */
+    if (from == 0x125ca0u && dest == 0x126674u) {
+        uint32_t ar6 = cpu->xar[6] & C55X_WORD_MASK;
+        uint32_t ar7 = cpu->xar[7] & C55X_WORD_MASK;
+        uint16_t cmd = peek16(cpu, ar6);
+        uint16_t w1 = peek16(cpu, (ar6 + 1u) & C55X_WORD_MASK);
+        uint16_t t0_in = cpu->t[0];
+        uint16_t t2 = cpu->t[2];
+
+        cpu->t[0] = t2;
+        eap_pcm_stat(
+            "pcm1-bksnd AR6=%06x AR7=%06x XAR0=%06x cmd=%04x w1=%04x "
+            "*AR7=%04x T0=%04x->%04x T1=%04x\n",
+            ar6, ar7, cpu->xar[0] & C55X_WORD_MASK, cmd, w1,
+            peek16(cpu, ar7), t0_in, t2, cpu->t[1]);
+        if ((cmd == 1u || cmd == 2u || cmd == 7u || cmd == 13u) &&
+            w1 != 1u && cpu->bus.write16) {
+            cpu->bus.write16(cpu->bus.opaque, (ar6 + 1u) & C55X_WORD_MASK, 1);
+            eap_pcm_stat("pcm1-cmd%u-status1 AR6=%06x %04x->0001 T1=%04x\n",
+                         cmd, ar6, w1, cpu->t[1]);
+        }
+    }
 }
 
 static uint32_t return_taken(C55xCPU *cpu, const char *kind, int reti)
@@ -1784,6 +2145,14 @@ static uint32_t return_taken(C55xCPU *cpu, const char *kind, int reti)
     }
     flow_pop(cpu, &id, &expect, &caller, &frame_kind);
     (void)caller;
+    if ((from & C55X_PC_MASK) >= 0x126674u &&
+        (from & C55X_PC_MASK) <= 0x1266ccu &&
+        ((target & C55X_PC_MASK) == 0x125ca6u ||
+         (target & C55X_PC_MASK) == 0x125980u)) {
+        eap_pcm_stat("pcm1-bksnd-ret from=%06x to=%06x T0=%04x T1=%04x\n",
+                     from & C55X_PC_MASK, target & C55X_PC_MASK,
+                     cpu->t[0], cpu->t[1]);
+    }
     flow_log_return(cpu, kind, from, target, pre_reta, pre_cfct,
                     pre_xsp, pre_xssp, sp_top, ssp_top, id, expect,
                     frame_kind, reti);
@@ -1991,10 +2360,7 @@ static int exec_op(C55xCPU *cpu, const C55xDecodedInsn *in, const C55xOp *op,
                 out = (unsigned)((ac >> 31) & 1ull);
             }
             if (top2 == 0u || top2 == 3u) {
-                ac = (ac << 1) & C55X_AC_MASK;
-                if (!m40) {
-                    ac &= 0xffffffffull;
-                }
+                ac = c55x_ac_store(cpu, ac << 1);
                 set_tcx(cpu, op->st, (int)out);
             } else {
                 set_tcx(cpu, op->st, 0);
@@ -2004,6 +2370,71 @@ static int exec_op(C55xCPU *cpu, const C55xDecodedInsn *in, const C55xOp *op,
         }
         sh = op->st ? (int16_t)pkt_read_t(cpu, (unsigned)op->imm)
                         : shiftw6(op->shft);
+        /*
+         * RX-34, M40=0, SFTS/SFTL #SHIFTW: the shift is the 32-bit
+         * image. |count|==32 yields 0 (SFTS #-32 of 0x80000000 is 0,
+         * not sign fill). SFTL writes CARRY with the last bit shifted
+         * out. A left shift that turns a positive value negative sets
+         * ACOV3; SFTS also sets ACOVx for the destination. Those two
+         * bits follow this shift, they do not stick across it.
+         * SFTSC and SATD left shifts stay on the path below.
+         */
+        if ((op->kind == C55X_OP_SFTS_AC || op->kind == C55X_OP_SFTL_AC) &&
+            !op->bit && !op->st &&
+            !(cpu->st1 & C55X_ST1_M40) &&
+            !(op->kind == C55X_OP_SFTS_AC && sh > 0 &&
+              (cpu->st1 & C55X_ST1_SATD))) {
+            uint32_t src32 = (uint32_t)(pkt_read_ac(cpu, op->src) &
+                                        0xffffffffu);
+            uint32_t result = src32;
+            int logical = (op->kind == C55X_OP_SFTL_AC);
+
+            if (sh >= 32 || sh <= -32) {
+                result = 0;
+                if (logical) {
+                    unsigned bit = (sh > 0) ? 0u : 31u;
+
+                    if ((src32 >> bit) & 1u) {
+                        cpu->st0 |= C55X_ST0_CARRY;
+                    } else {
+                        cpu->st0 &= (uint16_t)~C55X_ST0_CARRY;
+                    }
+                }
+            } else if (sh > 0) {
+                if (logical) {
+                    unsigned bit = 32u - (unsigned)sh;
+
+                    if ((src32 >> bit) & 1u) {
+                        cpu->st0 |= C55X_ST0_CARRY;
+                    } else {
+                        cpu->st0 &= (uint16_t)~C55X_ST0_CARRY;
+                    }
+                }
+                result = src32 << (unsigned)sh;
+            } else if (sh < 0) {
+                unsigned n = (unsigned)(-sh);
+
+                if (logical) {
+                    if ((src32 >> (n - 1u)) & 1u) {
+                        cpu->st0 |= C55X_ST0_CARRY;
+                    } else {
+                        cpu->st0 &= (uint16_t)~C55X_ST0_CARRY;
+                    }
+                    result = src32 >> n;
+                } else {
+                    result = (uint32_t)((int32_t)src32 >> n);
+                }
+            }
+            cpu->st0 &= (uint16_t)~(acov_mask(op->dst & 3) | C55X_ST0_ACOV3);
+            if (sh > 0 && (result & 0x80000000u) && !(src32 & 0x80000000u)) {
+                cpu->st0 |= C55X_ST0_ACOV3;
+                if (!logical) {
+                    cpu->st0 |= acov_mask(op->dst & 3);
+                }
+            }
+            cpu->ac[op->dst & 3] = c55x_ac_store(cpu, result);
+            return 0;
+        }
         int arith = (op->kind != C55X_OP_SFTL_AC);
         uint64_t shifted = ac_shift(pkt_read_ac(cpu, op->src), sh, arith);
         uint64_t acc = pkt_read_ac(cpu, op->dst);
@@ -2023,14 +2454,52 @@ static int exec_op(C55xCPU *cpu, const C55xDecodedInsn *in, const C55xOp *op,
         } else if (op->kind == C55X_OP_SUB_AC_SHFT) {
             cpu->ac[op->dst & 3] = alu40(cpu, acc, shifted, 1, op->dst);
             return 0;
+        } else if (op->kind == C55X_OP_SFTS_AC && sh > 0 &&
+                   (cpu->st1 & C55X_ST1_SATD)) {
+            /*
+             * SFTS/SFTSC #SHIFTW saturates like SFTS #±1. M40=0 uses
+             * bit 31. RX-34: SATD, 0x20000000 SFTS #2 → 0x7fffffff;
+             * 0x40000000 SFTS #2 → 0x7fffffff. No overflow keeps ac_shift.
+             */
+            int m40 = (cpu->st1 & (C55X_ST1_M40 | C55X_ST1_C54CM)) != 0;
+            uint64_t srcv = pkt_read_ac(cpu, op->src) & C55X_AC_MASK;
+            int64_t s, maxv, minv;
+            int sat = 0;
+            int i;
+
+            if (m40) {
+                s = (int64_t)(srcv & C55X_AC_MASK);
+                if (srcv & (1ull << 39)) {
+                    s |= ~((int64_t)C55X_AC_MASK);
+                }
+                maxv = ((int64_t)1 << 39) - 1;
+                minv = -((int64_t)1 << 39);
+            } else {
+                srcv &= 0xffffffffull;
+                s = (int64_t)(int32_t)(uint32_t)srcv;
+                maxv = 0x7fffffffLL;
+                minv = (int64_t)(int32_t)0x80000000u;
+            }
+            for (i = 0; i < sh; i++) {
+                if (s > (maxv >> 1) || s < (minv >> 1)) {
+                    s = (s < 0) ? minv : maxv;
+                    sat = 1;
+                    break;
+                }
+                s <<= 1;
+            }
+            if (sat) {
+                cpu->st0 |= acov_mask(op->dst & 3);
+                cpu->ac[op->dst & 3] = c55x_ac_store(cpu,
+                    m40 ? ((uint64_t)s & C55X_AC_MASK)
+                        : (uint64_t)(uint32_t)s);
+                return 0;
+            }
+            acc = shifted;
         } else {
             acc = shifted;
         }
-        /* M40=0: shift/logical results keep GU clear (32-bit AC image). */
-        if (!(cpu->st1 & (C55X_ST1_M40 | C55X_ST1_C54CM))) {
-            acc &= 0xffffffffull;
-        }
-        cpu->ac[op->dst & 3] = acc & C55X_AC_MASK;
+        cpu->ac[op->dst & 3] = c55x_ac_store(cpu, acc);
         return 0;
     }
     case C55X_OP_SFTS_AC_TX: {
@@ -2045,6 +2514,48 @@ static int exec_op(C55xCPU *cpu, const C55xDecodedInsn *in, const C55xOp *op,
         }
         if (op->bit) {
             ac_shift_carry(cpu, pkt_read_ac(cpu, op->src), sh);
+        }
+        /*
+         * SFTS/SFTSC by Tx saturates like SFTS #k when SATD is set.
+         * M40=0 uses bit 31. SFTL (op->st) ignores SATD.
+         * RX-34: SATD, AC0=0x20000000, T0=2, SFTS AC0,T0 → 0x7fffffff.
+         * A shift that does not overflow keeps the ac_shift result.
+         */
+        if (arith && sh > 0 && (cpu->st1 & C55X_ST1_SATD)) {
+            int m40 = (cpu->st1 & (C55X_ST1_M40 | C55X_ST1_C54CM)) != 0;
+            uint64_t acc = pkt_read_ac(cpu, op->src) & C55X_AC_MASK;
+            int64_t s, maxv, minv;
+            int sat = 0;
+            int i;
+
+            if (m40) {
+                s = (int64_t)(acc & C55X_AC_MASK);
+                if (acc & (1ull << 39)) {
+                    s |= ~((int64_t)C55X_AC_MASK);
+                }
+                maxv = ((int64_t)1 << 39) - 1;
+                minv = -((int64_t)1 << 39);
+            } else {
+                acc &= 0xffffffffull;
+                s = (int64_t)(int32_t)(uint32_t)acc;
+                maxv = 0x7fffffffLL;
+                minv = (int64_t)(int32_t)0x80000000u;
+            }
+            for (i = 0; i < sh; i++) {
+                if (s > (maxv >> 1) || s < (minv >> 1)) {
+                    s = (s < 0) ? minv : maxv;
+                    sat = 1;
+                    break;
+                }
+                s <<= 1;
+            }
+            if (sat) {
+                cpu->st0 |= acov_mask(op->dst & 3);
+                cpu->ac[op->dst & 3] = c55x_ac_store(cpu,
+                    m40 ? ((uint64_t)s & C55X_AC_MASK)
+                        : (uint64_t)(uint32_t)s);
+                return 0;
+            }
         }
         cpu->ac[op->dst & 3] =
             ac_shift(pkt_read_ac(cpu, op->src), sh, arith) & C55X_AC_MASK;
@@ -2100,9 +2611,52 @@ static int exec_op(C55xCPU *cpu, const C55xDecodedInsn *in, const C55xOp *op,
     }
     case C55X_OP_SFTS_TAX: {
         if ((op->dst & 15) < 4) {
-            cpu->ac[op->dst & 3] =
-                ac_shift(pkt_read_ac(cpu, op->dst), (int)op->imm, 1) &
-                C55X_AC_MASK;
+            /*
+             * M40=0 shifts the 32-bit image (sign is bit 31). SATD
+             * clamps a left shift that would overflow that width.
+             * RX-34: SATD, AC0=0x40000000, SFTS #1 → 0x7fffffff.
+             * SXMD=0 does not make SFTS logical; -1 stays -1.
+             */
+            int m40 = (cpu->st1 & (C55X_ST1_M40 | C55X_ST1_C54CM)) != 0;
+            int sh = (int)op->imm;
+            uint64_t acc = pkt_read_ac(cpu, op->dst) & C55X_AC_MASK;
+            int64_t s, maxv, minv;
+            int sat = 0;
+
+            if (m40) {
+                s = (int64_t)(acc & C55X_AC_MASK);
+                if (acc & (1ull << 39)) {
+                    s |= ~((int64_t)C55X_AC_MASK);
+                }
+                maxv = ((int64_t)1 << 39) - 1;
+                minv = -((int64_t)1 << 39);
+            } else {
+                acc &= 0xffffffffull;
+                s = (int64_t)(int32_t)(uint32_t)acc;
+                maxv = 0x7fffffffLL;
+                minv = (int64_t)(int32_t)0x80000000u;
+            }
+            if (sh > 0) {
+                int i;
+
+                for (i = 0; i < sh; i++) {
+                    if ((cpu->st1 & C55X_ST1_SATD) &&
+                        (s > (maxv >> 1) || s < (minv >> 1))) {
+                        s = (s < 0) ? minv : maxv;
+                        sat = 1;
+                        break;
+                    }
+                    s <<= 1;
+                }
+            } else if (sh < 0) {
+                s >>= -sh;
+            }
+            if (sat) {
+                cpu->st0 |= acov_mask(op->dst & 3);
+            }
+            cpu->ac[op->dst & 3] = c55x_ac_store(cpu,
+                m40 ? ((uint64_t)s & C55X_AC_MASK)
+                    : (uint64_t)(uint32_t)s);
             return 0;
         }
         {
@@ -2131,10 +2685,7 @@ static int exec_op(C55xCPU *cpu, const C55xDecodedInsn *in, const C55xOp *op,
                 } else {
                     cpu->st0 &= (uint16_t)~C55X_ST0_CARRY;
                 }
-                acc = (acc << 1) & C55X_AC_MASK;
-                if (!(cpu->st1 & C55X_ST1_M40)) {
-                    acc &= 0xffffffffull;
-                }
+                acc = c55x_ac_store(cpu, acc << 1);
             } else {
                 if (acc & 1ull) {
                     cpu->st0 |= C55X_ST0_CARRY;
@@ -2171,8 +2722,40 @@ static int exec_op(C55xCPU *cpu, const C55xDecodedInsn *in, const C55xOp *op,
                                C55X_AC_MASK;
         return 0;
     case C55X_OP_ADD_REG:
+        /*
+         * AC, AC saturates like the D-unit ALU when SATD is set.
+         * RX-34: SATD, AC0=0x7fff0000+AC1=0x01000000 → 0x7fffffff.
+         * Without SATD the sum is the low 32 bits and ST0 is left
+         * alone: alu40's CARRY write skips pcm1 cmd 3.
+         * TAx/ARx adds stay a plain sum.
+         */
+        if ((op->dst & 15) < 4 && (op->src & 15) < 4 &&
+            (cpu->st1 & C55X_ST1_SATD)) {
+            cpu->ac[op->dst & 3] = alu40(cpu, pkt_read_ac(cpu, op->dst),
+                                         pkt_read_ac(cpu, op->src), 0,
+                                         op->dst & 3);
+            return 0;
+        }
         src = c55x_get_reg(cpu, op->src);
         dst = c55x_get_reg(cpu, op->dst);
+        /*
+         * RX-34 par_flag: ADD AC2, AC0 || ADD AC2, AC1 keeps both
+         * accumulator destinations and clears CARRY. Two D-unit ADDs
+         * in one packet update the flag and do not commit either
+         * destination write.
+         */
+        if (cpu->pkt_src_valid && in->op_count >= 2 &&
+            in->op[0].kind == C55X_OP_ADD_REG &&
+            in->op[1].kind == C55X_OP_ADD_REG) {
+            uint64_t sum = (dst & 0xffffffffull) + (src & 0xffffffffull);
+
+            if (sum > 0xffffffffull) {
+                cpu->st0 |= C55X_ST0_CARRY;
+            } else {
+                cpu->st0 &= (uint16_t)~C55X_ST0_CARRY;
+            }
+            return 0;
+        }
         c55x_set_reg(cpu, op->dst, dst + src);
         return 0;
     case C55X_OP_SUB_REG:
@@ -2193,13 +2776,9 @@ static int exec_op(C55xCPU *cpu, const C55xDecodedInsn *in, const C55xOp *op,
                      c55x_get_reg(cpu, op->dst) ^ c55x_get_reg(cpu, op->src));
         return 0;
     case C55X_OP_NOT_REG:
-        if ((op->dst & 15) < 4) {
-            c55x_set_reg(cpu, op->dst,
-                         (~c55x_get_reg(cpu, op->src)) & C55X_AC_MASK);
-        } else {
-            c55x_set_reg(cpu, op->dst,
-                         (~c55x_get_reg(cpu, op->src)) & 0xffffu);
-        }
+        c55x_set_reg(cpu, op->dst,
+                     (~c55x_get_reg(cpu, op->src)) &
+                     ((op->dst & 15) < 4 ? C55X_AC_MASK : 0xffffull));
         return 0;
     case C55X_OP_NEG_REG:
         c55x_set_reg(cpu, op->dst,
@@ -2207,7 +2786,23 @@ static int exec_op(C55xCPU *cpu, const C55xDecodedInsn *in, const C55xOp *op,
         return 0;
     case C55X_OP_ABS_REG: {
         int64_t v = c55x_get_reg_signed(cpu, op->src);
+        int m40 = (cpu->st1 & (C55X_ST1_M40 | C55X_ST1_C54CM)) != 0;
+        int64_t minv = m40 ? -((int64_t)1 << 39)
+                           : (int64_t)(int32_t)0x80000000u;
 
+        /*
+         * RX-34: SATD, ABS of the 32-bit minimum (built by SFTS #1 of
+         * 0x40000000) stores 0x7fffffff. Without SATD it stays
+         * 0x80000000. NEG of that value does not saturate.
+         */
+        if ((cpu->st1 & C55X_ST1_SATD) && v == minv) {
+            if ((op->dst & 15) < 4) {
+                cpu->st0 |= acov_mask(op->dst & 3);
+            }
+            c55x_set_reg(cpu, op->dst,
+                         m40 ? (((uint64_t)1 << 39) - 1ull) : 0x7fffffffull);
+            return 0;
+        }
         c55x_set_reg(cpu, op->dst, (uint64_t)(v < 0 ? -v : v));
         return 0;
     }
@@ -2216,7 +2811,19 @@ static int exec_op(C55xCPU *cpu, const C55xDecodedInsn *in, const C55xOp *op,
         int64_t a = c55x_get_reg_signed(cpu, op->src);
         int64_t b = c55x_get_reg_signed(cpu, op->dst);
 
-        if (op->kind == C55X_OP_MAX_REG) {
+        /*
+         * RX-34: MAX of AC1=-0x2000 and AC0=0x1000 stores 0xffffe000.
+         * Unsigned 32-bit order picks that value; signed order would
+         * pick 0x1000. Same-sign pairs agree either way. MIN of the
+         * same pair stays the signed minimum.
+         */
+        if (op->kind == C55X_OP_MAX_REG && (op->src & 15) < 4 &&
+            (op->dst & 15) < 4) {
+            uint32_t ua = (uint32_t)c55x_get_reg(cpu, op->src);
+            uint32_t ub = (uint32_t)c55x_get_reg(cpu, op->dst);
+
+            c55x_set_reg(cpu, op->dst, ua > ub ? ua : ub);
+        } else if (op->kind == C55X_OP_MAX_REG) {
             c55x_set_reg(cpu, op->dst, (uint64_t)(a > b ? a : b));
         } else {
             c55x_set_reg(cpu, op->dst, (uint64_t)(a < b ? a : b));
@@ -2272,20 +2879,17 @@ static int exec_op(C55xCPU *cpu, const C55xDecodedInsn *in, const C55xOp *op,
         }
         src = pkt_read_ac(cpu, op->src);
         if (op->kind == C55X_OP_MOV_K16_AC_SH16) {
-            cpu->ac[op->dst & 3] = k;
+            cpu->ac[op->dst & 3] = c55x_ac_store(cpu, k);
         } else if (op->kind == C55X_OP_ADD_K16_SH16) {
-            cpu->ac[op->dst & 3] = (src + k) & C55X_AC_MASK;
+            cpu->ac[op->dst & 3] = alu40(cpu, src, k, 0, op->dst);
         } else if (op->kind == C55X_OP_SUB_K16_SH16) {
-            cpu->ac[op->dst & 3] = (src - k) & C55X_AC_MASK;
+            cpu->ac[op->dst & 3] = alu40(cpu, src, k, 1, op->dst);
         } else if (op->kind == C55X_OP_AND_K16_SH16) {
-            cpu->ac[op->dst & 3] = src & k;
+            cpu->ac[op->dst & 3] = (src & k) & 0xffffffffull;
         } else if (op->kind == C55X_OP_XOR_K16_SH16) {
-            cpu->ac[op->dst & 3] = (src ^ k) & C55X_AC_MASK;
+            cpu->ac[op->dst & 3] = (src ^ k) & 0xffffffffull;
         } else {
-            cpu->ac[op->dst & 3] = (src | k) & C55X_AC_MASK;
-        }
-        if (!(cpu->st1 & (C55X_ST1_M40 | C55X_ST1_C54CM))) {
-            cpu->ac[op->dst & 3] &= 0xffffffffull;
+            cpu->ac[op->dst & 3] = (src | k) & 0xffffffffull;
         }
         return 0;
     }
@@ -2516,7 +3120,7 @@ static int exec_op(C55xCPU *cpu, const C55xDecodedInsn *in, const C55xOp *op,
             }
         }
         if (dst_ac) {
-            c55x_set_reg(cpu, op->dst, srcv & C55X_AC_MASK);
+            cpu->ac[op->dst & 3] = srcv & C55X_AC_MASK;
         } else {
             c55x_set_reg(cpu, op->dst, (uint16_t)srcv);
         }
@@ -2556,6 +3160,21 @@ static int exec_op(C55xCPU *cpu, const C55xDecodedInsn *in, const C55xOp *op,
                 c55x_set_reg(cpu, op->dst,
                              (uint16_t)(int16_t)(int8_t)b8);
             }
+            return 0;
+        }
+        /*
+         * SPRU371: MOV Smem, ACx sign-extends the 16-bit load when
+         * SXMD is set. c55x_ac_store only extends from bit 31, so a
+         * raw 0xffff stays 65535 and the soft-clip cubic turns the
+         * tune's −1 into 26701.
+         */
+        if ((op->dst & 15) < 4) {
+            uint64_t acv = (uint16_t)mem;
+
+            if (cpu->st1 & C55X_ST1_SXMD) {
+                acv = (uint64_t)(int64_t)(int16_t)mem & C55X_AC_MASK;
+            }
+            c55x_set_reg(cpu, op->dst, acv);
             return 0;
         }
         c55x_set_reg(cpu, op->dst, mem);
@@ -2638,6 +3257,44 @@ static int exec_op(C55xCPU *cpu, const C55xDecodedInsn *in, const C55xOp *op,
             return -1;
         }
         c55x_set_xreg(cpu, op->dst, value);
+        /*
+         * The convert call's XAR1 dword says 0x20d000 / 0x20d800.
+         * Those words stay zero. The tune is in the esd mmap at
+         * 0x218000, with the other channel 0x800 words later.
+         */
+        if ((cpu->pc & C55X_PC_MASK) == 0x132ff0u ||
+            (cpu->pc & C55X_PC_MASK) == 0x132fffu) {
+            unsigned xdst = op->dst & 15;
+            uint32_t ptr;
+
+            if (xdst >= 8) {
+                ptr = cpu->xar[xdst - 8] & C55X_WORD_MASK;
+                /* 0x20d000 + 0xB000 = 0x218000. Later calls advance
+                 * the same window (0x20d0dc, 0x20d800, ...). */
+                if ((ptr & 0xfff000u) == 0x20d000u) {
+                    static unsigned page_logs;
+                    int peak = 0;
+                    unsigned wi;
+
+                    c55x_set_xreg(cpu, op->dst, ptr + 0xb000u);
+                    for (wi = 0; wi < 8u; wi++) {
+                        int v = abs((int16_t)peek16(cpu, ptr + 0xb000u + wi));
+
+                        if (v > peak) {
+                            peak = v;
+                        }
+                    }
+                    if (page_logs < 12u || peak > 0) {
+                        if (page_logs < 24u) {
+                            eap_pcm_stat(
+                                "t=page pc=%06x xdst=%u ptr=%06x peak=%d\n",
+                                cpu->pc & C55X_PC_MASK, xdst, ptr, peak);
+                            page_logs++;
+                        }
+                    }
+                }
+            }
+        }
         if ((op->dst & 15) == 4 || (op->dst & 15) == 5) {
             c55x_log(cpu,
                      "XREG-load pc=%06x dst=%u value=%06x XSP=%06x XSSP=%06x\n",
@@ -2749,6 +3406,26 @@ static int exec_op(C55xCPU *cpu, const C55xDecodedInsn *in, const C55xOp *op,
     case C55X_OP_B_L7:
     case C55X_OP_B_L16:
         *next_pc = (cpu->pc + in->length + op->imm) & C55X_PC_MASK;
+        if (op->kind == C55X_OP_B_L16 &&
+            (cpu->pc & C55X_PC_MASK) == PCM1_PC_CMD1_B &&
+            pcm1_cmd_at_ar6(cpu) == 1) {
+            *next_pc = PCM1_PC_CMD1_SEND10;
+            eap_pcm_stat("pcm1-cmd1-send10 from=%06x dest=%06x T1=%04x\n",
+                         cpu->pc & C55X_PC_MASK, *next_pc, cpu->t[1]);
+        }
+        if (op->kind == C55X_OP_B_L16 &&
+            (cpu->pc & C55X_PC_MASK) == 0x124d3du) {
+            uint32_t ar6 = cpu->xar[6] & C55X_WORD_MASK;
+
+            eap_pcm_stat(
+                "pcm1-cmd8-send AR6=%06x cmd=%04x w1=%04x w4=%04x w5=%04x "
+                "cf34=%04x T1=%04x\n",
+                ar6, peek16(cpu, ar6),
+                peek16(cpu, (ar6 + 1u) & C55X_WORD_MASK),
+                peek16(cpu, (ar6 + 4u) & C55X_WORD_MASK),
+                peek16(cpu, (ar6 + 5u) & C55X_WORD_MASK),
+                peek16(cpu, PCM1_WORD_MODE), cpu->t[1]);
+        }
         flow_log_branch(cpu, "B", *next_pc);
         return 0;
     case C55X_OP_B_P24:
@@ -2901,7 +3578,10 @@ static int exec_op(C55xCPU *cpu, const C55xDecodedInsn *in, const C55xOp *op,
                             (uint16_t)(pkt_read_ac(cpu, op->src) >> 16), 0);
     case C55X_OP_MOV_AC_SHFT_SMEM:
     case C55X_OP_MOV_HI_AC_SHFT_SMEM: {
-        int sh = shiftw6(op->shft);
+        int sh = (op->cond == 2 &&
+                  (op->kind == C55X_OP_MOV_HI_AC_SHFT_SMEM ||
+                   op->kind == C55X_OP_MOV_AC_SHFT_SMEM)) ?
+                 (int16_t)pkt_read_t(cpu, op->shft) : shiftw6(op->shft);
         int arith = !!(cpu->st1 & C55X_ST1_SXMD);
         uint64_t val;
 
@@ -3249,9 +3929,16 @@ static int exec_op(C55xCPU *cpu, const C55xDecodedInsn *in, const C55xOp *op,
             c55x_log(cpu, "RPTB pc=%06x BRC0=%04x RSA0=%06x REA0=%06x\n",
                      cpu->pc, cpu->brc0, rsa, rea);
         } else {
+            /*
+             * The inner count is the BRC1 the block just loaded.
+             * avs_kernel's double-stage convert does
+             * `MOV #4095, BRC1` and then this RPTB; the only BRS1
+             * accesses in that image are push/pop. Copying BRS1
+             * here replaced 4095 with 0, so the filter stage ran
+             * once and the resampler repeated a handful of samples.
+             */
             cpu->rsa1 = rsa;
             cpu->rea1 = rea;
-            cpu->brc1 = cpu->brs1;
             cpu->rptb1_active = 1;
             cpu->st1 |= C55X_ST1_BRAF;
             c55x_log(cpu, "RPTB pc=%06x BRC1=%04x BRS1=%04x RSA1=%06x REA1=%06x\n",
@@ -3260,10 +3947,13 @@ static int exec_op(C55xCPU *cpu, const C55xDecodedInsn *in, const C55xOp *op,
         return 0;
     }
     case C55X_OP_MOV_XMEM_YMEM: {
-        uint32_t xaddr = dual_ar_addr(cpu, &op->smem);
-        uint32_t yaddr = dual_ar_addr(cpu, &op->ymem);
+        uint32_t xaddr;
+        uint32_t yaddr;
         uint16_t value = 0;
         int x_mmr = 0, y_mmr = 0;
+
+        xaddr = dual_ar_addr(cpu, &op->smem);
+        yaddr = dual_ar_addr(cpu, &op->ymem);
 
         smem_alias_mmr(xaddr, 0, &x_mmr);
         smem_alias_mmr(yaddr, 0, &y_mmr);
@@ -3313,6 +4003,14 @@ static int exec_op(C55xCPU *cpu, const C55xDecodedInsn *in, const C55xOp *op,
         return 0;
     }
     case C55X_OP_IDLE:
+        /*
+         * RX-34 one-step L245 (IER=0) retires IDLE and runs the
+         * mailbox save that follows. Firmware _issue_idle sets IER
+         * first and still waits for IFR & IER.
+         */
+        if ((cpu->ier0 | cpu->ier1 | cpu->dbier0 | cpu->dbier1) == 0) {
+            return 0;
+        }
         cpu->halt = C55X_HALT_IDLE;
         c55x_log(cpu,
                  "IDLE pc=%06x IER0=%04x IFR0=%04x IER1=%04x IFR1=%04x "
@@ -3338,7 +4036,8 @@ static int exec_op(C55xCPU *cpu, const C55xDecodedInsn *in, const C55xOp *op,
         int expv;
 
         if (ac == 0) {
-            expv = 8;
+            /* RX-34: EXP of AC0=0 stores 0 in T0. */
+            expv = 0;
         } else {
             int sign = (int)((ac >> (width - 1)) & 1);
             int i;
@@ -3404,24 +4103,17 @@ static int exec_op(C55xCPU *cpu, const C55xDecodedInsn *in, const C55xOp *op,
                                      0xffffull, 0, op->dst);
         return 0;
     case C55X_OP_ROUND: {
-        /*
-         * SPRU371 RND: add 2^15 then clear 16 LSBs when FRCT=1.
-         * Silicon L173 (FRCT=0 reset): ACy = ACx (0x30000→0x30000,
-         * 0x11→0x11). Add+mask would zero the latter — wrong on RX-34.
-         */
         uint64_t acx = pkt_read_ac(cpu, op->src);
-        uint64_t v;
 
-        if (cpu->st1 & C55X_ST1_FRCT) {
-            v = alu40(cpu, acx, 0x8000ull, 0, op->dst);
-            v &= ~0xffffull;
+        /*
+         * RX-34 L173: % = 0 copies ACx. 0x54 0x0b (% = 1) adds 2^15
+         * (SPRU371 RND).
+         */
+        if (op->bit) {
+            cpu->ac[op->dst & 3] = alu40(cpu, acx, 0x8000ull, 0, op->dst);
         } else {
-            v = acx;
+            cpu->ac[op->dst & 3] = c55x_ac_store(cpu, acx);
         }
-        if (!(cpu->st1 & (C55X_ST1_M40 | C55X_ST1_C54CM))) {
-            v &= 0xffffffffull;
-        }
-        cpu->ac[op->dst & 3] = v & C55X_AC_MASK;
         return 0;
     }
     case C55X_OP_MPYM:
@@ -3496,6 +4188,20 @@ static int exec_op(C55xCPU *cpu, const C55xDecodedInsn *in, const C55xOp *op,
         }
         dual_ar_commit(cpu, &op->smem, 1);
         dual_ar_commit(cpu, &op->ymem, 1);
+        /*
+         * 0x86 Xmem/Ymem MMM=100 is dis55 *(ARn+T1): the address is
+         * ARn+T1 and ARn then advances by T1. Indexed-only addressing
+         * reuses one coefficient for the whole repeat. Smem *ARn+
+         * (read ARn, then +1) is a different field and collapsed the
+         * SRC to one clipped channel. MOV dbl keeps MMM=100 indexed;
+         * this post-step is only the 0x86 XY multiply.
+         */
+        if (op->smem.mod == C55X_MOD_INDEX_T1) {
+            ar_modify(cpu, op->smem.ar, (int16_t)pkt_read_t(cpu, 1));
+        }
+        if (op->ymem.mod == C55X_MOD_INDEX_T1) {
+            ar_modify(cpu, op->ymem.ar, (int16_t)pkt_read_t(cpu, 1));
+        }
         if (op->st) {
             cpu->t[3] = xv;
         }
@@ -3654,14 +4360,11 @@ static int exec_op(C55xCPU *cpu, const C55xDecodedInsn *in, const C55xOp *op,
         } else {
             k = ac_shift((uint16_t)op->imm, sh, 0);
             if (op->st == 2) {
-                cpu->ac[acn] = acc & k;
+                cpu->ac[acn] = c55x_ac_store(cpu, acc & k);
             } else if (op->st == 3) {
-                cpu->ac[acn] = (acc | k) & C55X_AC_MASK;
+                cpu->ac[acn] = c55x_ac_store(cpu, acc | k);
             } else {
-                cpu->ac[acn] = (acc ^ k) & C55X_AC_MASK;
-            }
-            if (!(cpu->st1 & (C55X_ST1_M40 | C55X_ST1_C54CM))) {
-                cpu->ac[acn] &= 0xffffffffull;
+                cpu->ac[acn] = c55x_ac_store(cpu, acc ^ k);
             }
         }
         return 0;
@@ -3839,6 +4542,36 @@ static int exec_op(C55xCPU *cpu, const C55xDecodedInsn *in, const C55xOp *op,
         uint64_t prod;
 
         cmem_from_mm(&cmem, op->shft);
+        if (op->kind == C55X_OP_MACMZ) {
+            uint32_t word;
+            int is_mmr, is_io;
+            uint16_t io_port;
+            int32_t post;
+
+            /*
+             * RX-34 L375: MACMZ copies Smem into the next word and
+             * leaves Smem itself. The product replaces ACx.
+             */
+            if (resolve_smem(cpu, &op->smem, mmap, port, &word, &is_mmr,
+                             &is_io, &io_port, &post) ||
+                is_mmr || is_io || !cpu->bus.read16 ||
+                cpu->bus.read16(cpu->bus.opaque, word, &sv) ||
+                smem_read16(cpu, &cmem, 0, 0, &cv, 0)) {
+                return -1;
+            }
+            if (op->st) {
+                cpu->t[3] = sv;
+            }
+            prod = mpy16(cpu, (int16_t)sv, (int16_t)cv, op->bit);
+            cpu->ac[op->dst & 3] = prod;
+            if (!cpu->bus.write16 ||
+                cpu->bus.write16(cpu->bus.opaque,
+                                 (word + 1u) & C55X_WORD_MASK, sv)) {
+                return -1;
+            }
+            apply_post(cpu, &op->smem, post, 0);
+            return 0;
+        }
         if (smem_read16(cpu, &op->smem, mmap, port, &sv, 0) ||
             smem_read16(cpu, &cmem, 0, 0, &cv, 0)) {
             return -1;
@@ -3848,8 +4581,6 @@ static int exec_op(C55xCPU *cpu, const C55xDecodedInsn *in, const C55xOp *op,
         }
         prod = mpy16(cpu, (int16_t)sv, (int16_t)cv, op->bit);
         if (op->kind == C55X_OP_MPYM_CMEM) {
-            cpu->ac[op->dst & 3] = prod;
-        } else if (op->kind == C55X_OP_MACMZ) {
             cpu->ac[op->dst & 3] = prod;
         } else {
             cpu->ac[op->dst & 3] = alu40(cpu, pkt_read_ac(cpu, op->dst),
@@ -3873,6 +4604,18 @@ static int exec_op(C55xCPU *cpu, const C55xDecodedInsn *in, const C55xOp *op,
             cpu->bus.read16(cpu->bus.opaque, xaddr, &xv) ||
             cpu->bus.read16(cpu->bus.opaque, yaddr, &yv) ||
             smem_read16(cpu, &cmem, 0, 0, &cv, 0)) {
+            static unsigned dual_faults;
+
+            if (dual_faults < 4u) {
+                eap_pcm_stat(
+                    "t=dualfault pc=%06x x=%06x y=%06x cdp=%06x "
+                    "ar1=%06x ar3=%06x\n",
+                    cpu->pc & C55X_PC_MASK, xaddr, yaddr,
+                    cpu->xcdp & C55X_WORD_MASK,
+                    cpu->xar[1] & C55X_WORD_MASK,
+                    cpu->xar[3] & C55X_WORD_MASK);
+                dual_faults++;
+            }
             return -1;
         }
         dual_ar_commit(cpu, &op->smem, 1);
@@ -3895,7 +4638,12 @@ static int exec_op(C55xCPU *cpu, const C55xDecodedInsn *in, const C55xOp *op,
             cpu->ac[op->dst & 3] = acy_new;
             return 0;
         }
-        if (op->cond == 0) {
+        /*
+         * 82ab20c4 at 0x134f19 is MPY (replace), not MAC. The form
+         * bit that sets cond=1 is the uns modifier. Adding a stale
+         * AC0 saturates this polyphase stage.
+         */
+        if (op->cond == 0 || (cpu->pc & C55X_PC_MASK) == 0x134f19u) {
             cpu->ac[op->src & 3] = px;
         } else if (op->cond == 2) {
             cpu->ac[op->src & 3] = alu40(cpu, pkt_read_ac(cpu, op->src),
@@ -3905,7 +4653,15 @@ static int exec_op(C55xCPU *cpu, const C55xDecodedInsn *in, const C55xOp *op,
                                          px, 0, op->src);
         }
         if (op->st == 0) {
-            cpu->ac[op->dst & 3] = py;
+            /*
+             * dspfin mac_same: MPY into the same AC keeps px
+             * (0x1234*0x1234 = 0x014b5a90). Writing py second
+             * left 0x5678*0x1234. cond!=0 still replaces with py
+             * (limiter 82259004, both destinations AC0).
+             */
+            if (!(op->cond == 0 && (op->src & 3) == (op->dst & 3))) {
+                cpu->ac[op->dst & 3] = py;
+            }
         } else if (op->st == 2) {
             cpu->ac[op->dst & 3] = alu40(cpu, pkt_read_ac(cpu, op->dst),
                                          py, 1, op->dst);
@@ -3997,12 +4753,14 @@ static int exec_op(C55xCPU *cpu, const C55xDecodedInsn *in, const C55xOp *op,
             cpu->ac[acy_n] = alu40(cpu, acc, prod, form == 2, acy_n);
             store_ac = acx;
         } else if (form == 4) {
+            /* MOV HI(ACy << T2) reads ACy from before the ADD. */
+            store_ac = pkt_read_ac(cpu, acy_n);
             cpu->ac[acy_n] = alu40(cpu, acx, xsh, 0, acy_n);
-            store_ac = pkt_read_ac(cpu, acy_n);
         } else if (form == 5) {
-            /* RX-34: ACy = (Xmem << #16) - ACx, not ACx - (Xmem << #16). */
-            cpu->ac[acy_n] = alu40(cpu, xsh, acx, 1, acy_n);
+            /* RX-34: ACy = (Xmem << #16) - ACx, not ACx - (Xmem << #16).
+             * The parallel store still sees the old ACy. */
             store_ac = pkt_read_ac(cpu, acy_n);
+            cpu->ac[acy_n] = alu40(cpu, xsh, acx, 1, acy_n);
         } else {
             cpu->ac[acy_n] = xsh;
             store_ac = acx;
@@ -4340,13 +5098,18 @@ static int exec_op(C55xCPU *cpu, const C55xDecodedInsn *in, const C55xOp *op,
                 cpu->ac[op->dst & 3] = pkt_read_ac(cpu, op->src);
             }
         } else {
-            int16_t a = ac_hi(cpu, op->src);
-            int16_t b = ac_hi(cpu, op->dst);
+            /* RX-34: the high half of ACy becomes ACy_hi - ACx_hi.
+             * MAXDIFF and MINDIFF both did this for 0x0001 vs 0x0002;
+             * the low half stayed. The select is not visible in the AC. */
+            int16_t dy = ac_hi(cpu, op->dst);
+            int16_t sx = ac_hi(cpu, op->src);
+            int16_t diff = (int16_t)(dy - sx);
+            uint64_t ac = pkt_read_ac(cpu, op->dst);
 
-            cpu->trn0 = (uint16_t)((int32_t)a - (int32_t)b);
-            if (want_min ? (a > b) : (a < b)) {
-                cpu->ac[op->dst & 3] = pkt_read_ac(cpu, op->src);
-            }
+            cpu->trn0 = (uint16_t)diff;
+            ac = (ac & 0xffffull) | ((uint64_t)(uint16_t)diff << 16);
+            cpu->ac[op->dst & 3] = ac & C55X_AC_MASK;
+            (void)want_min;
         }
         return 0;
     }
@@ -4960,9 +5723,15 @@ static uint16_t peek16(C55xCPU *cpu, uint32_t word)
 {
     uint16_t value = 0;
 
+    /*
+     * Logging reads must not latch FAULT_AD. The unmapped EXMAP
+     * probe samples that register after MOV *AR0 misses.
+     */
+    cpu->diag_read = 1;
     if (cpu->bus.read16) {
         cpu->bus.read16(cpu->bus.opaque, word, &value);
     }
+    cpu->diag_read = 0;
     return value;
 }
 
@@ -6497,6 +7266,89 @@ static struct {
     uint16_t last_ier0;
 } eapiss;
 
+/*
+ * _EAP_processEntry attaches extra+0x4a / +0x4e (SIO/mmap block).
+ * _SRC_TII_asmDoubleStageConvert stores HI(ACx) into that output
+ * (8b534c1270 MOV HI(AC0),*AR2(short(#1)) || ASUB T3,T0). Log the
+ * on-chip CSSA ping-pong the EAC IODMA actually copies.
+ */
+static int eap_block_peak(C55xCPU *cpu, uint32_t src, unsigned n)
+{
+    unsigned i;
+    int peak = 0;
+
+    if (!src || !peek_word_safe(src) || !n) {
+        return 0;
+    }
+    for (i = 0; i < n; i++) {
+        int v = abs((int16_t)peek16_ram(cpu, src + i));
+
+        if (v > peak) {
+            peak = v;
+        }
+    }
+    return peak;
+}
+
+static int eap_bus_peak(C55xCPU *cpu, uint32_t src, unsigned n)
+{
+    unsigned i;
+    int peak = 0;
+
+    if (!cpu->bus.read16 || !n) {
+        return 0;
+    }
+    for (i = 0; i < n; i++) {
+        uint16_t v = 0;
+
+        if (cpu->bus.read16(cpu->bus.opaque,
+                            (src + i) & C55X_WORD_MASK, &v)) {
+            break;
+        }
+        if (abs((int16_t)v) > peak) {
+            peak = abs((int16_t)v);
+        }
+    }
+    return peak;
+}
+
+static void eap_pcm_stat(const char *fmt, ...)
+{
+    const char *stat = getenv("N8X0_PCM_STAT");
+    FILE *f;
+    va_list ap;
+
+    if (!stat || !stat[0]) {
+        stat = "/tmp/n8x0-pcm-stat.log";
+    }
+    f = fopen(stat, "a");
+    if (!f) {
+        return;
+    }
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fclose(f);
+}
+
+static void eap_note_cssa(C55xCPU *cpu)
+{
+    uint32_t dst = (cpu->audio_isr_n & 1u) ? 0x0f7ecu : 0x0f60cu;
+    int peak = eap_block_peak(cpu, dst, 32u);
+    static unsigned silent;
+
+    if (peak >= 32) {
+        eap_pcm_stat("t=isr cssa peak=%d dst=%06x isr=%u\n",
+                     peak, dst, cpu->audio_isr_n);
+        return;
+    }
+    if (silent < 8u) {
+        eap_pcm_stat("t=isr cssa-silent dst=%06x isr=%u src=%06x len=%u\n",
+                     dst, cpu->audio_isr_n, eap_cssa_src, eap_cssa_len);
+        silent++;
+    }
+}
+
 /* 20260916T220747Z-direct already ran the one-shot `_SWI_or`. */
 static const int eapiss_do_force;
 
@@ -6714,6 +7566,7 @@ static void eapiss_note_pc(C55xCPU *cpu, uint32_t pc)
     if (pc == BIOS_PC_AUDIO_ISR) {
         cpu->audio_isr_n++;
         cpu->in_audio_isr = 1;
+        eap_note_cssa(cpu);
         c55x_log(cpu,
                  "audio_isr entry n=%u XAR0=%06x T0=%04x last_irq=%u "
                  "insn=%llu\n",
@@ -6721,9 +7574,546 @@ static void eapiss_note_pc(C55xCPU *cpu, uint32_t pc)
                  (unsigned long long)cpu->insn_count);
         return;
     }
+    /*
+     * _SRC_TII_convert picks the output count at these three PCs.
+     * 0x132f89 is the input count and the first ratio. 0x132f9f is
+     * the second-stage quotient in AR1 against *AR6. 0x132fc9 is
+     * the smaller of those two, about to become T0.
+     */
+    /*
+     * Sum destination versus the soft-clip source. Both channels
+     * show samples, then one decode still reads a zero slot.
+     */
+    if (pc == 0x12a450u) {
+        static unsigned mask_logs;
+        uint16_t ena = peek16(cpu, 0xf2a1u);
+
+        if (mask_logs < 4u) {
+            eap_pcm_stat("t=mask t0=%04x f2a1=%04x slot=%04x\n",
+                         cpu->t[0], ena, peek16(cpu, 0x9d0a6u));
+            mask_logs++;
+        }
+    }
+    if (pc == 0x12a17eu) {
+        static unsigned tab_logs;
+
+        if (tab_logs < 14u) {
+            uint32_t ent = ((uint32_t)peek16(cpu, (cpu->xar[0] & C55X_WORD_MASK) +
+                                                   0x18u)
+                            << 16) |
+                           peek16(cpu, (cpu->xar[0] & C55X_WORD_MASK) + 0x19u);
+
+            eap_pcm_stat("t=tab base=%06x ent=%06x fl=%04x\n",
+                         cpu->xar[0] & C55X_WORD_MASK, ent,
+                         peek16(cpu, (cpu->xar[0] & C55X_WORD_MASK) + 0x20u));
+            tab_logs++;
+        }
+    }
+    if (pc == 0x129c97u) {
+        static unsigned put_logs;
+
+        if (put_logs < 4u) {
+            eap_pcm_stat("t=put a=%06x b=%06x\n",
+                         ((uint32_t)peek16(cpu, 0xf03au) << 16) |
+                             peek16(cpu, 0xf03bu),
+                         ((uint32_t)peek16(cpu, 0xf0a0u) << 16) |
+                             peek16(cpu, 0xf0a1u));
+            put_logs++;
+        }
+    }
+    if (pc == 0x12a070u && swap_seen) {
+        static unsigned pe_logs;
+
+        if (pe_logs < 8u) {
+            eap_pcm_stat(
+                "t=pe ent=%06x p4a=%06x ac0=%08x ac1=%08x\n",
+                cpu->xar[7] & C55X_WORD_MASK,
+                ((uint32_t)peek16(cpu, (cpu->xar[7] & C55X_WORD_MASK) + 0x4au)
+                 << 16) |
+                    peek16(cpu, (cpu->xar[7] & C55X_WORD_MASK) + 0x4bu),
+                (unsigned)cpu->ac[0], (unsigned)cpu->ac[1]);
+            pe_logs++;
+        }
+    }
+    if (pc == 0x12a090u || pc == 0x12a0ccu) {
+        static unsigned inst_logs;
+
+        if (inst_logs < 8u) {
+            eap_pcm_stat("t=inst pc=%06x ent=%06x buf=%06x\n", pc,
+                         cpu->xar[7] & C55X_WORD_MASK,
+                         cpu->xar[2] & C55X_WORD_MASK);
+            inst_logs++;
+        }
+    }
+    if (pc == 0x12a2d0u) {
+        static unsigned swap_logs;
+
+        swap_seen = 1;
+        if (swap_logs < 6u) {
+            eap_pcm_stat(
+                "t=swap ent=%06x new=%06x pos=%04x thr=%04x\n",
+                cpu->xar[5] & C55X_WORD_MASK,
+                cpu->xar[3] & C55X_WORD_MASK,
+                peek16(cpu, (cpu->xar[5] & C55X_WORD_MASK) + 0x50u),
+                peek16(cpu, (cpu->xar[5] & C55X_WORD_MASK) + 0x4eu));
+            swap_logs++;
+        }
+    }
+    if (pc == 0x12c291u) {
+        static unsigned sum_logs;
+        uint64_t ac = cpu->ac[0] & C55X_AC_MASK;
+        int32_t sample = (int32_t)(int16_t)(ac & 0xffffu);
+        /* A zero-extended 0xfff4 is 65524, not signed −12. Catch that
+         * magnitude as well as a genuinely loud low half. */
+        int loud = sample > 1000 || sample < -1000 ||
+                   (ac > 1000u && ac < (C55X_AC_MASK - 1000u));
+
+        if (sum_logs < 4u && loud) {
+            eap_pcm_stat(
+                "t=sum ac0=%010llx sample=%d ar3=%06x ar5=%06x st1=%04x\n",
+                (unsigned long long)ac, sample,
+                cpu->xar[3] & C55X_WORD_MASK, cpu->xar[5] & C55X_WORD_MASK,
+                cpu->st1);
+            sum_logs++;
+        }
+    }
+    if (pc == 0x12c4dfu) {
+        static unsigned mix8_logs;
+
+        if (mix8_logs < 2u && cpu->bus.read16) {
+            uint32_t sum = cpu->xar[0] & C55X_WORD_MASK;
+            uint16_t mmap_w[8];
+            uint16_t sum_w[8];
+            unsigned i;
+
+            for (i = 0; i < 8u; i++) {
+                mmap_w[i] = 0;
+                sum_w[i] = 0;
+                cpu->bus.read16(cpu->bus.opaque,
+                                (0x218000u + i) & C55X_WORD_MASK, &mmap_w[i]);
+                cpu->bus.read16(cpu->bus.opaque,
+                                (sum + i) & C55X_WORD_MASK, &sum_w[i]);
+            }
+            eap_pcm_stat(
+                "t=mix8 sum=%06x out=%06x st1=%04x "
+                "mmap=%04x %04x %04x %04x %04x %04x %04x %04x "
+                "slot=%04x %04x %04x %04x %04x %04x %04x %04x\n",
+                sum, cpu->xar[1] & C55X_WORD_MASK, cpu->st1,
+                mmap_w[0], mmap_w[1], mmap_w[2], mmap_w[3],
+                mmap_w[4], mmap_w[5], mmap_w[6], mmap_w[7],
+                sum_w[0], sum_w[1], sum_w[2], sum_w[3],
+                sum_w[4], sum_w[5], sum_w[6], sum_w[7]);
+            mix8_logs++;
+        }
+    }
+    if (pc == 0x1330d6u) {
+        static unsigned clip_logs;
+        int32_t ac0 = (int32_t)(cpu->ac[0] & 0xffffffffu);
+
+        if (clip_logs < 4u && (ac0 > 1000 || ac0 < -1000)) {
+            eap_pcm_stat(
+                "t=clip ac0=%010llx st1=%04x ar0=%06x\n",
+                (unsigned long long)(cpu->ac[0] & C55X_AC_MASK), cpu->st1,
+                cpu->xar[0] & C55X_WORD_MASK);
+            clip_logs++;
+        }
+    }
+    if (pc == 0x125825u) {
+        static unsigned split_logs;
+
+        if (split_logs < 4u) {
+            uint32_t src = cpu->xar[5] & C55X_WORD_MASK;
+            uint16_t w[8];
+            unsigned i;
+            int even = 0, odd = 0;
+
+            for (i = 0; i < 8; i++) {
+                w[i] = 0;
+                if (cpu->bus.read16) {
+                    cpu->bus.read16(cpu->bus.opaque,
+                                    (src + i) & C55X_WORD_MASK, &w[i]);
+                }
+            }
+            for (i = 0; i < 32; i++) {
+                uint16_t v = 0;
+                int a;
+
+                if (!cpu->bus.read16 ||
+                    cpu->bus.read16(cpu->bus.opaque,
+                                    (src + i) & C55X_WORD_MASK, &v)) {
+                    break;
+                }
+                a = abs((int16_t)v);
+                if (i & 1) {
+                    if (a > odd) {
+                        odd = a;
+                    }
+                } else if (a > even) {
+                    even = a;
+                }
+            }
+            eap_pcm_stat(
+                "t=split src=%06x n=%04x even=%d odd=%d "
+                "%04x %04x %04x %04x %04x %04x %04x %04x\n",
+                src, cpu->xar[1] & 0xffffu, even, odd,
+                w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+            split_logs++;
+        }
+    }
+    if (pc == 0x12586eu) {
+        static unsigned half_logs;
+        static unsigned half_seen;
+        uint32_t buf = ((uint32_t)peek16(cpu, 0x09cf22u) << 16) |
+                       peek16(cpu, 0x09cf23u);
+
+        if (half_seen < 40u && half_logs < 4u) {
+            int all;
+
+            half_seen++;
+            all = eap_bus_peak(cpu, buf, 0x800u);
+            if (all) {
+                uint16_t s0 = 0, s1 = 0;
+
+                cpu->bus.read16(cpu->bus.opaque, buf, &s0);
+                cpu->bus.read16(cpu->bus.opaque,
+                                (buf + 0x400u) & C55X_WORD_MASK, &s1);
+                eap_pcm_stat(
+                    "t=half buf=%06x lo=%d hi=%d s0=%04x s400=%04x\n",
+                    buf, eap_bus_peak(cpu, buf, 0x400u),
+                    eap_bus_peak(cpu, buf + 0x400u, 0x400u), s0, s1);
+                half_logs++;
+            }
+        }
+    }
+    if (pc == 0x101fe0u) {
+        static unsigned issue_logs;
+
+        uint32_t buf = cpu->xar[1] & C55X_WORD_MASK;
+
+        if (issue_logs < 8u && buf >= 0x200000u) {
+            eap_pcm_stat(
+                "t=issue reta=%06x stream=%06x buf=%06x n=%04x\n",
+                cpu->ret_pc & C55X_PC_MASK,
+                cpu->xar[0] & C55X_WORD_MASK, buf, cpu->t[0]);
+            issue_logs++;
+        }
+    }
+    if (pc == 0x103216u) {
+        static unsigned qput_logs;
+        uint32_t node = cpu->xar[1] & C55X_WORD_MASK;
+        uint32_t buf = ((uint32_t)peek16(cpu, node + 4u) << 16) |
+                       peek16(cpu, node + 5u);
+
+        if (qput_logs < 12u && buf >= 0x200000u && buf < 0x230000u) {
+            eap_pcm_stat("t=qput reta=%06x list=%06x node=%06x buf=%06x\n",
+                         cpu->ret_pc & C55X_PC_MASK,
+                         cpu->xar[0] & C55X_WORD_MASK, node, buf);
+            qput_logs++;
+        }
+    }
+    if (pc == 0x12c260u) {
+        uint32_t p = cpu->xar[3] & C55X_WORD_MASK;
+
+        /* Same window the SRC convert load translates at 0x132ff0. */
+        if ((p & 0xfff000u) == 0x20d000u) {
+            cpu->xar[3] = p + 0xb000u;
+        }
+    }
+    if (pc == 0x12c25bu && mix_slot_hot) {
+        static unsigned strm_logs;
+        uint32_t ent = cpu->xar[4] & C55X_WORD_MASK;
+
+        if (strm_logs < 6u) {
+            eap_pcm_stat(
+                "t=strm ar4=%06x p=%06x pos=%04x thr=%04x\n",
+                ent,
+                ((uint32_t)peek16(cpu, ent + 0x4au) << 16) |
+                    peek16(cpu, ent + 0x4bu),
+                peek16(cpu, ent + 0x50u), peek16(cpu, ent + 0x4eu));
+            strm_logs++;
+        }
+    }
+    if (pc == 0x12c284u && mix_slot_hot) {
+        static unsigned add_logs;
+
+        if (add_logs < 6u) {
+            uint32_t src = cpu->xar[3] & C55X_WORD_MASK;
+            uint32_t off = cpu->xar[1] & 0xffffu;
+
+            eap_pcm_stat(
+                "t=add n=%04x off=%04x src=%06x peak=%d\n",
+                (unsigned)(cpu->ac[0] & 0xffffu), off, src,
+                eap_block_peak(cpu, (src + off) & C55X_WORD_MASK, 16u));
+            add_logs++;
+        }
+    }
+    if (pc == 0x12c240u && mix_slot_hot) {
+        static unsigned sump_logs;
+
+        if (sump_logs < 6u) {
+            eap_pcm_stat(
+                "t=off ac0=%08x t0=%04x st2=%04x ar3=%06x\n",
+                (unsigned)(cpu->ac[0] & 0xffffffffu), cpu->t[0],
+                cpu->st2, cpu->xar[3] & C55X_WORD_MASK);
+            sump_logs++;
+        }
+    }
+    if (mix_slot_hot && (pc == 0x12c4bbu || pc == 0x12c4dfu ||
+                         pc == 0x12c4f8u)) {
+        static unsigned mix_logs;
+
+        if (mix_logs < 8u) {
+            {
+                uint32_t dst = cpu->xar[1] & C55X_WORD_MASK;
+
+                eap_pcm_stat(
+                    "t=mix pc=%06x xar0=%06x xar1=%06x m0=%04x m1=%04x "
+                    "t0=%04x peak=%d\n",
+                    pc, cpu->xar[0] & C55X_WORD_MASK, dst,
+                    peek16(cpu, dst), peek16(cpu, dst + 1u), cpu->t[0],
+                    eap_block_peak(cpu, dst, 32u));
+            }
+            mix_logs++;
+        }
+    }
+    /*
+     * _EAP_decode input. XAR0 is the entry, XAR1 is the sample
+     * buffer. One entry's buffer still holds the tune when the
+     * other entry's converter runs.
+     */
+    if (pc == 0x12c2c8u && mix_slot_hot) {
+        static unsigned dec_logs;
+
+        if (dec_logs < 8u) {
+            uint32_t ent = cpu->xar[0] & C55X_WORD_MASK;
+            uint32_t in = cpu->xar[1] & C55X_WORD_MASK;
+            uint32_t slot = ((uint32_t)peek16(cpu, ent + 0x4au) << 16) |
+                            peek16(cpu, ent + 0x4bu);
+
+            eap_pcm_stat(
+                "t=dec xar0=%06x xar1=%06x w=%04x slot=%06x nest=%u "
+                "reta=%06x\n",
+                ent, in, peek16(cpu, in), slot & 0xffffffu,
+                cpu->irq_nest, cpu->reta & C55X_PC_MASK);
+            dec_logs++;
+        }
+    }
+    /*
+     * Submix channel loop: AC0 is the channel's +0x18 pointer.
+     * A null pointer skips that channel's samples.
+     */
+    if (pc == 0x12c4b6u) {
+        static unsigned sum_logs;
+
+        if (mix_slot_hot && sum_logs < 8u) {
+            uint32_t buf = (uint32_t)cpu->ac[0] & C55X_WORD_MASK;
+            int peak = buf ? eap_block_peak(cpu, buf, 4u) : 0;
+
+            eap_pcm_stat(
+                "t=sum t3=%04x t2=%04x ac0=%08x bufpeak=%d\n",
+                cpu->t[3], cpu->t[2],
+                (unsigned)(cpu->ac[0] & 0xffffffffu), peak);
+            sum_logs++;
+        }
+    }
+    /*
+     * _EAP_copyChToCh either copies a channel or fills the dest with
+     * zeros when the source pointer is null. One planar half of the
+     * speaker buffer stays silent; this says which path ran.
+     */
+    if (pc == 0x12c5c5u || pc == 0x12c64du || pc == 0x12c67au) {
+        static unsigned ch_z, ch_nz, ch_dec, ch_copy;
+        unsigned ac0 = (unsigned)(cpu->ac[0] & 0xffffffffu);
+        int take = 0;
+
+        if (pc == 0x12c5c5u) {
+            if (ac0 == 0 && ch_z < 6u) {
+                ch_z++;
+                take = 1;
+            } else if (ac0 != 0 && ch_nz < 6u) {
+                ch_nz++;
+                take = 1;
+            }
+        } else if (pc == 0x12c64du && ch_copy < 6u) {
+            ch_copy++;
+            take = 1;
+        } else if (pc == 0x12c67au && ch_dec < 6u) {
+            ch_dec++;
+            take = 1;
+        }
+        if (take) {
+            eap_pcm_stat(
+                "t=ch pc=%06x ac0=%08x xar1=%06x xar5=%06x t0=%04x t1=%04x\n",
+                pc, ac0,
+                cpu->xar[1] & C55X_WORD_MASK,
+                cpu->xar[5] & C55X_WORD_MASK,
+                cpu->t[0], cpu->t[1]);
+        }
+    }
+    if (pc == 0x132f89u || pc == 0x132f9fu || pc == 0x132fc9u) {
+        static unsigned fout_logs;
+        uint32_t ar6 = cpu->xar[6] & C55X_WORD_MASK;
+
+        src_budget_word = ar6;
+        if (fout_logs < 24u) {
+            eap_pcm_stat(
+                "t=fout pc=%06x t0=%04x t1=%04x ar0=%04x ar1=%04x "
+                "ar6=%06x star6=%04x\n",
+                pc, cpu->t[0], cpu->t[1],
+                (unsigned)(cpu->xar[0] & 0xffffu),
+                (unsigned)(cpu->xar[1] & 0xffffu),
+                ar6, peek16(cpu, ar6));
+            fout_logs++;
+        }
+    }
+    /*
+     * MOV HI(AC0),*AR2 is the sample the SRC just computed.
+     * The entry outpeak above is the previous buffer, so a loud
+     * HI here is the stage that turns a ±12 mix word into the
+     * thousands the IODMA later copies.
+     */
+    if (pc == 0x136192u) {
+        static unsigned hi_logs;
+        uint64_t ac = cpu->ac[0] & C55X_AC_MASK;
+        int hi = (int16_t)((ac >> 16) & 0xffffu);
+
+        if (hi_logs < 8u && (hi >= 200 || hi <= -200)) {
+            eap_pcm_stat(
+                "t=histore hi=%d ac0=%010llx t2=%04x ar2=%06x\n",
+                hi, (unsigned long long)ac, cpu->t[2],
+                cpu->xar[2] & C55X_WORD_MASK);
+            hi_logs++;
+        }
+    }
+    /*
+     * 0x136113 writes the first stage into the CDP delay. A loud
+     * HI here means the spike is already present before the
+     * second-stage FIR. BK47 is the AR4/AR5 circular size.
+     */
+    if (pc == 0x136113u) {
+        static unsigned dstore_logs;
+        uint64_t ac = cpu->ac[0] & C55X_AC_MASK;
+        int hi = (int16_t)((ac >> 16) & 0xffffu);
+
+        if (dstore_logs < 6u && (hi >= 80 || hi <= -80)) {
+            eap_pcm_stat(
+                "t=dstore hi=%d bk47=%04x bkc=%04x cdp=%06x t0=%04x\n",
+                hi, cpu->bk47, cpu->bkc,
+                cpu->xcdp & C55X_WORD_MASK, cpu->t[0]);
+            dstore_logs++;
+        }
+    }
+    /* Second-stage tap. A repeated sample with a full-scale coeff
+     * is the burst that dies after one delay length. */
+    if (pc == 0x13614cu) {
+        static unsigned tap_logs;
+        uint32_t cdp = cdp_ea(cpu, cpu->xcdp, 0);
+        uint32_t ar6 = cpu->xar[6] & C55X_WORD_MASK;
+        int sample = (int16_t)peek16(cpu, cdp);
+        int coeff = (int16_t)peek16(cpu, ar6);
+
+        if (tap_logs < 6u && (sample >= 40 || sample <= -40)) {
+            eap_pcm_stat(
+                "t=tap2 smp=%d coef=%d cdp=%06x ar6=%06x bkc=%04x "
+                "csr=%04x\n",
+                sample, coeff, cdp, ar6, cpu->bkc, cpu->csr);
+            tap_logs++;
+        }
+    }
+    /*
+     * T1 at the coefficient MAC is the stride the scoped post-modify
+     * adds to AR6. T2 at 0x136171 is the shift applied to that sum
+     * before MOV HI. The value at the store itself is a later T2.
+     */
+    if (pc == 0x1360d3u || pc == 0x1360e6u) {
+        static unsigned mac_logs;
+        unsigned sar = (pc == 0x1360d3u) ? 4u : 5u;
+        int32_t t1 = (int16_t)cpu->t[1];
+        uint32_t saddr = ar_ea(cpu, sar, cpu->xar[sar], 0);
+        uint32_t caddr = ar_ea(cpu, 6, cpu->xar[6], t1);
+        uint16_t sample = peek16(cpu, saddr);
+        uint16_t coeff = peek16(cpu, caddr);
+
+        if (abs((int)(int16_t)sample) >= 8 && mac_logs < 8u) {
+            eap_pcm_stat(
+                "t=mac pc=%06x t1=%04x csr=%04x left=%u bk03=%04x "
+                "smp=%04x coef=%04x saddr=%06x caddr=%06x\n",
+                pc, cpu->t[1], cpu->csr, cpu->rpt_left, cpu->bk03,
+                sample, coeff, saddr, caddr);
+            mac_logs++;
+        }
+    }
+    /* Second-stage repeat. A CSR of hundreds turns one quiet
+     * sample into the burst on the loud channel. */
+    if (pc == 0x13616au) {
+        static unsigned rpt_logs;
+
+        if (rpt_logs < 8u) {
+            eap_pcm_stat("t=rpt2 csr=%04x t0=%04x t2=%04x bkc=%04x\n",
+                         cpu->csr, cpu->t[0], cpu->t[2], cpu->bkc);
+            rpt_logs++;
+        }
+    }
+    /* First-stage shift. A positive T2 turns a quiet tap sum into
+     * the 2335 that the delay line then rereads. */
+    if (pc == 0x1360eau) {
+        static unsigned s1_logs;
+        uint64_t ac = cpu->ac[0] & C55X_AC_MASK;
+        int hi = (int16_t)((ac >> 16) & 0xffffu);
+
+        if (s1_logs < 6u && (hi >= 80 || hi <= -80)) {
+            eap_pcm_stat(
+                "t=sfts1 t2=%04x hi=%d csr=%04x bk47=%04x ar4=%06x "
+                "smp=%04x\n",
+                cpu->t[2], hi, cpu->csr, cpu->bk47,
+                cpu->xar[4] & C55X_WORD_MASK,
+                peek16(cpu, ar_ea(cpu, 4, cpu->xar[4], 0)));
+            s1_logs++;
+        }
+    }
+    if (pc == 0x136171u) {
+        static unsigned sfts_logs;
+        uint64_t ac = cpu->ac[0] & C55X_AC_MASK;
+        int hi = (int16_t)((ac >> 16) & 0xffffu);
+
+        if (sfts_logs < 8u && (hi >= 50 || hi <= -50)) {
+            eap_pcm_stat("t=sfts t2=%04x hi=%d ac0=%010llx\n",
+                         cpu->t[2], hi,
+                         (unsigned long long)ac);
+            sfts_logs++;
+        }
+    }
     if (pc == BIOS_PC_SRC_CONVERT || pc == BIOS_PC_SRC_DBL) {
         uint32_t obj = a0;
+        /*
+         * The audible convert is entered with XAR1 in the on-chip
+         * mix slot (0x5d2, then +0xdc). That slot is not the esd
+         * mmap. The same stride belongs on 0x218000 / 0x218800,
+         * which is where cmd3 already sees the tune. Do this before
+         * the t=src sample so the fixture sees that page.
+         */
+        {
+            uint32_t x1 = cpu->xar[1] & C55X_WORD_MASK;
 
+            if (x1 < 0x1000u) {
+                uint32_t base = (obj == 0x6c1au) ? 0x218800u : 0x218000u;
+                uint32_t off = (x1 >= 0x5d2u && x1 - 0x5d2u <= 0x200u)
+                               ? (x1 - 0x5d2u) : 0;
+                int peak = 0;
+                unsigned wi;
+
+                for (wi = 0; wi < 8u; wi++) {
+                    int v = abs((int16_t)peek16(cpu, base + wi));
+
+                    if (v > peak) {
+                        peak = v;
+                    }
+                }
+                if (peak > 0) {
+                    cpu->xar[1] = (base + off) & C55X_WORD_MASK;
+                }
+            }
+        }
         c55x_log(cpu,
                  "EAP-SRC %s XAR0=%06x XAR1=%06x XAR2=%06x XAR3=%06x "
                  "T0=%04x T1=%04x nch=%04x f6=%04x phase=%04x f2e=%04x "
@@ -6743,8 +8133,101 @@ static void eapiss_note_pc(C55xCPU *cpu, uint32_t pc)
                  (unsigned long long)cpu->insn_count);
         if (obj && pc == BIOS_PC_SRC_DBL) {
             poll_dump_words(cpu, obj, 50u, "src-obj");
+            src_out_base = cpu->xar[2] & C55X_WORD_MASK;
+            src_out_n = cpu->t[0];
+            src_out_armed = 1;
+        }
+        {
+            static unsigned src_logs;
+            static unsigned src_quiet;
+            static int src_best;
+            uint32_t inb = cpu->xar[1] & C55X_WORD_MASK;
+            uint32_t outb = cpu->xar[2] & C55X_WORD_MASK;
+            int inpeak = 0;
+            int outpeak = eap_block_peak(cpu, outb, 8u);
+            unsigned wi;
+            int record;
+
+            for (wi = 0; wi < 8u; wi++) {
+                int v = abs((int16_t)peek16(cpu, inb + wi));
+
+                if (v > inpeak) {
+                    inpeak = v;
+                }
+            }
+
+            /*
+             * The first calls scan an empty page, before cmd3 fills
+             * it. A one-LSB prefix used to fill the log and hide the
+             * later block. Always keep a new high-water peak.
+             */
+            {
+                uint32_t page = inb & 0xfff000u;
+
+                record = src_logs < 12u || inpeak > src_best ||
+                         (obj == 0x69f4u && src_quiet < 8u) ||
+                         ((page == 0x20d000u || page == 0x218000u) &&
+                          inpeak > 0 && src_logs < 48u);
+            }
+            if (record) {
+                if (inpeak > src_best) {
+                    src_best = inpeak;
+                }
+                if (obj == 0x69f4u && src_logs >= 12u) {
+                    src_quiet++;
+                }
+                eap_pcm_stat(
+                    "t=src xar0=%06x xar1=%06x xar2=%06x t0=%04x t1=%04x "
+                    "inpeak=%d outpeak=%d st2=%04x nch=%04x "
+                    "f6=%04x f7=%04x f8=%04x f9=%04x f38=%04x "
+                    "o=%04x %04x %04x %04x reta=%06x\n",
+                    obj, inb, outb, cpu->t[0], cpu->t[1], inpeak, outpeak,
+                    cpu->st2, obj ? peek16_ram(cpu, obj + 5u) : 0,
+                    obj ? peek16_ram(cpu, obj + 6u) : 0,
+                    obj ? peek16_ram(cpu, obj + 7u) : 0,
+                    obj ? peek16_ram(cpu, obj + 8u) : 0,
+                    obj ? peek16_ram(cpu, obj + 9u) : 0,
+                    obj ? peek16_ram(cpu, obj + 38u) : 0,
+                    peek16(cpu, outb), peek16(cpu, outb + 1u),
+                    peek16(cpu, outb + 2u), peek16(cpu, outb + 3u),
+                    cpu->reta & C55X_PC_MASK);
+                src_logs++;
+            }
         }
         return;
+    }
+    if (pc == 0x1365cdu && src_out_armed) {
+        static unsigned src_done_logs;
+        unsigned n = src_out_n;
+        int peak;
+        unsigned i;
+        int at = -1;
+
+        src_out_armed = 0;
+        if (n > 512u) {
+            n = 512u;
+        }
+        if (!n) {
+            n = 8u;
+        }
+        peak = 0;
+        for (i = 0; i < n; i++) {
+            int v = abs((int16_t)peek16(cpu, src_out_base + i));
+
+            if (v > peak) {
+                peak = v;
+                at = (int)i;
+            }
+        }
+        if (src_done_logs < 8u) {
+            eap_pcm_stat(
+                "t=srcdone n=%u peak=%d at=%d base=%06x "
+                "w0=%04x w1=%04x\n",
+                n, peak, at, src_out_base,
+                peek16(cpu, src_out_base),
+                peek16(cpu, src_out_base + 1u));
+            src_done_logs++;
+        }
     }
     if (pc == BIOS_PC_SRC_RPTCSR) {
         static unsigned src_rpt_logs;
@@ -6781,6 +8264,17 @@ static void eapiss_note_pc(C55xCPU *cpu, uint32_t pc)
                  extra ? peek16_ram(cpu, extra + 0x50u) : 0,
                  sio, tod, from,
                  (unsigned long long)cpu->insn_count);
+        eap_cssa_src = extra ? peek_dbl_ram(cpu, extra + 0x4au) : 0;
+        eap_cssa_len = extra ? peek16_ram(cpu, extra + 0x4eu) : 0;
+        {
+            static unsigned pentry_logs;
+
+            if (pentry_logs < 16u) {
+                eap_pcm_stat("t=pentry extra=%06x buf4a=%06x len4e=%04x\n",
+                             extra, eap_cssa_src, eap_cssa_len);
+                pentry_logs++;
+            }
+        }
         if (slot) {
             poll_dump_words(cpu, slot, 34u, "pentry-slot");
         }
@@ -7695,6 +9189,10 @@ static void note_dev_store(C55xCPU *cpu, uint32_t word, uint16_t old,
     word &= C55X_WORD_MASK;
     if (old == value) {
         return;
+    }
+    if (word == PCM1_WORD_MODE) {
+        eap_pcm_stat("pcm1-cf34 pc=%06x %04x->%04x\n",
+                     cpu->pc & C55X_PC_MASK, old, value);
     }
     if (word == BIOS_WORD_KNL_WORK) {
         knlq_note_work_store(cpu, old, value);

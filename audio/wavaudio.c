@@ -37,17 +37,103 @@ typedef struct WAVVoiceOut {
     FILE *f;
     RateCtl rate;
     int total_samples;
+    int tune_rewound;
 } WAVVoiceOut;
+
+uint32_t omap2420_dsp_pcm1_tune_take(uint8_t *out, uint32_t n);
+int omap2420_dsp_pcm1_capture(void);
+
+/*
+ * esd_send_file's write is the wake-up PCM, including its leading
+ * silence. The EAC gate drops that silence, and a dropped opening
+ * shifts the attack off the start of the reference. While the startup
+ * smoke is recording, the file is that queue. A CSSA-only run
+ * (no pcm1 kicks) still records the DMA block.
+ */
+/* Header is 44 bytes. Drop any EAC samples written before the file arrived. */
+static void wav_rewind_tune(WAVVoiceOut *wav)
+{
+    if (wav->tune_rewound || !wav->f) {
+        return;
+    }
+    if (fseek(wav->f, 44, SEEK_SET) != 0) {
+        return;
+    }
+    wav->total_samples = 0;
+    wav->tune_rewound = 1;
+}
+
+static void wav_write_tune(WAVVoiceOut *wav, HWVoiceOut *hw)
+{
+    int cap_frames = hw->info.freq * 15 / 2;
+    uint8_t chunk[4096];
+
+    while (wav->total_samples < cap_frames) {
+        uint32_t room = (uint32_t)(cap_frames - wav->total_samples) *
+                        hw->info.bytes_per_frame;
+        uint32_t got;
+
+        if (room > sizeof(chunk)) {
+            room = sizeof(chunk);
+        }
+        got = omap2420_dsp_pcm1_tune_take(chunk, room);
+        if (!got) {
+            break;
+        }
+        if (fwrite(chunk, got, 1, wav->f) != 1) {
+            dolog("wav_write_tune: fwrite of %u bytes failed\nReason: %s\n",
+                  got, strerror(errno));
+            break;
+        }
+        wav->total_samples += got / hw->info.bytes_per_frame;
+    }
+}
 
 static size_t wav_write_out(HWVoiceOut *hw, void *buf, size_t len)
 {
     WAVVoiceOut *wav = (WAVVoiceOut *) hw;
     int64_t bytes = audio_rate_get_bytes(&wav->rate, &hw->info, len);
+    int cap_frames = hw->info.freq * 15 / 2;
+    static uint8_t prev[4096];
+    static size_t prev_n;
+
     assert(bytes % hw->info.bytes_per_frame == 0);
+    if (!bytes) {
+        return 0;
+    }
+    if (omap2420_dsp_pcm1_capture()) {
+        wav_rewind_tune(wav);
+        wav_write_tune(wav, hw);
+        return bytes;
+    }
+    /*
+     * IODMA CLNK completes the same CSSA block twice. Recording
+     * both stretches the tune and the sample-by-sample compare fails.
+     * The second completion still runs; it is not a new period.
+     */
+    if (bytes <= (int64_t)sizeof(prev) && prev_n == (size_t)bytes &&
+        memcmp(prev, buf, prev_n) == 0) {
+        return bytes;
+    }
+    /* The startup gate is 4.5–8 s. Stop the file before a loop
+     * of the last block pushes it past that window. */
+    if (wav->total_samples >= cap_frames) {
+        return bytes;
+    }
+    if (wav->total_samples + bytes / hw->info.bytes_per_frame > cap_frames) {
+        bytes = (int64_t)(cap_frames - wav->total_samples) *
+                hw->info.bytes_per_frame;
+    }
 
     if (bytes && fwrite(buf, bytes, 1, wav->f) != 1) {
         dolog("wav_write_out: fwrite of %" PRId64 " bytes failed\nReason: %s\n",
               bytes, strerror(errno));
+    }
+    if (bytes > 0 && bytes <= (int64_t)sizeof(prev)) {
+        memcpy(prev, buf, (size_t)bytes);
+        prev_n = (size_t)bytes;
+    } else {
+        prev_n = 0;
     }
 
     wav->total_samples += bytes / hw->info.bytes_per_frame;
@@ -138,12 +224,18 @@ static void wav_fini_out (HWVoiceOut *hw)
     WAVVoiceOut *wav = (WAVVoiceOut *) hw;
     uint8_t rlen[4];
     uint8_t dlen[4];
-    uint32_t datalen = wav->total_samples * hw->info.bytes_per_frame;
-    uint32_t rifflen = datalen + 36;
+    uint32_t datalen;
+    uint32_t rifflen;
 
     if (!wav->f) {
         return;
     }
+    if (omap2420_dsp_pcm1_capture()) {
+        wav_rewind_tune(wav);
+        wav_write_tune(wav, hw);
+    }
+    datalen = wav->total_samples * hw->info.bytes_per_frame;
+    rifflen = datalen + 36;
 
     le_store (rlen, rifflen, 4);
     le_store (dlen, datalen, 4);

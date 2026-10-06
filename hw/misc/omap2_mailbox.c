@@ -7,14 +7,18 @@
  * (OMAP2 type) and arch/arm/mach-omap2 mailbox platform data.
  *
  * This models the MMIO FIFOs, status, and IRQ bits only. It does not
- * execute C55x code or fabricate DSP Gateway mailbox words. MESSAGE
- * accepts 16-bit DSP stores: a first half at +0 occupies a FIFO slot
- * (MSGSTATUS counts it) without raising NEWMSG. A following +2 write
- * is the SPRU374 LSW of `MOV ACx, dbl`; the first half becomes the
- * protocol MSW and NEWMSG fires once so stock `_mbx_send` (`7070`
- * then `0019`) yields one ARM little-endian `0x70700019`. Raising
- * NEWMSG on the first half lets Linux pop `0x00007070` between the
- * two C55x write16s. The DSP IRQ user is pulsed on FIFO 0 NEWMSG
+ * execute C55x code or fabricate DSP Gateway mailbox words. MESSAGE is
+ * a little-endian 32-bit holding register (RX-34 2026-09-21
+ * MBOX_HALFWORD): a 16-bit store at +0 updates bits[15:0] and does not
+ * enqueue (MSGSTATUS stays 0, NEWMSG clear, 32-bit pop returns 0). A
+ * 16-bit store at +2 updates bits[31:16] and pushes the 32-bit image.
+ * A 32-bit writel pushes immediately. ARM writew 0x7070 / +2 0x0019
+ * therefore yields 0x00197070; writel 0x70700019 and DSP MOV dbl of
+ * AC0=0x70700019 still yield PROTREV 0x70700019. A lone writew 0x1111
+ * is not a FIFO word. NEWMSG/NOTFULL follow completed occupancy:
+ * NEWMSG iff a queued word exists; NOTFULL iff count < 4. Diablo
+ * OMAP2 ops are TYPE2 (drain then W1C); W1C of NEWMSG does not stick
+ * while MSGSTATUS>0. The DSP IRQ user is level on FIFO 0 NEWMSG
  * (ARM→DSP). NEWMSG(1) is the DSP's own TX complete and must not
  * re-enter `_mbx_send`. NOTFULL(1) must reach INT5: a full TX FIFO
  * makes `_mbx_send` OR IRQENABLE(1) with bit 3 and SEM_pend
@@ -168,8 +172,8 @@ struct omap2_mailbox_s {
     uint32_t irqstatus[OMAP2_MBOX_USERS];
     uint32_t irqenable[OMAP2_MBOX_USERS];
     struct omap2_mailbox_fifo fifo[OMAP2_MBOX_FIFOS];
-    /* Last 16-bit low-half MESSAGE push may still accept a high half. */
-    uint8_t msg_partial[OMAP2_MBOX_FIFOS];
+    /* 16-bit +0 latches bits[15:0]; +2 or writel commits. */
+    uint32_t msg_hold[OMAP2_MBOX_FIFOS];
     /* MOV dbl pops once: +0 returns MSW, +2 returns the latched LSW. */
     uint32_t msg_latched[OMAP2_MBOX_FIFOS];
     uint8_t msg_read_half[OMAP2_MBOX_FIFOS];
@@ -178,6 +182,7 @@ struct omap2_mailbox_s {
 static void omap2_mailbox_irq_update(struct omap2_mailbox_s *s)
 {
     int i;
+    static unsigned dsp_irq_logs;
 
     for (i = 0; i < OMAP2_MBOX_USERS; i++) {
         uint32_t mask = s->irqstatus[i] & s->irqenable[i];
@@ -192,7 +197,8 @@ static void omap2_mailbox_irq_update(struct omap2_mailbox_s *s)
             mask &= (OMAP2_MBOX_IRQ_NEWMSG(0) | OMAP2_MBOX_IRQ_NOTFULL(0) |
                      OMAP2_MBOX_IRQ_NOTFULL(1));
         }
-        if (i == 1 && mask) {
+        if (i == 1 && mask && dsp_irq_logs < 16u) {
+            dsp_irq_logs++;
             qemu_log_mask(LOG_UNIMP,
                           "omap2_mailbox: dsp-irq status=%08x enable=%08x "
                           "mask=%08x\n",
@@ -202,100 +208,92 @@ static void omap2_mailbox_irq_update(struct omap2_mailbox_s *s)
     }
 }
 
-static void omap2_mailbox_set_all_users(struct omap2_mailbox_s *s, uint32_t bit)
+static unsigned omap2_mailbox_completed(const struct omap2_mailbox_s *s,
+                                        unsigned m)
 {
-    int i;
-
-    for (i = 0; i < OMAP2_MBOX_USERS; i++) {
-        s->irqstatus[i] |= bit;
-    }
+    return s->fifo[m].count;
 }
 
-static uint32_t omap2_mailbox_idle_notfull_mask(void)
+/*
+ * IRQSTATUS is occupancy, not a sticky software latch. Idle empty
+ * FIFOs yield NOTFULL for every mailbox (RX-34 0xaaa). A completed
+ * word raises NEWMSG; filling to DEPTH clears NOTFULL.
+ */
+static void omap2_mailbox_sync_status(struct omap2_mailbox_s *s)
 {
-    /* RX-34 Phase D: empty FIFOs leave NOTFULL sticky = 0xaaa (bits 1,3,5,7,9,11). */
-    uint32_t mask = 0;
-    int m;
+    unsigned m, u;
+    uint32_t bits = 0;
 
     for (m = 0; m < OMAP2_MBOX_FIFOS; m++) {
-        mask |= OMAP2_MBOX_IRQ_NOTFULL(m);
+        if (omap2_mailbox_completed(s, m)) {
+            bits |= OMAP2_MBOX_IRQ_NEWMSG(m);
+        }
+        if (s->fifo[m].count < OMAP2_MBOX_DEPTH) {
+            bits |= OMAP2_MBOX_IRQ_NOTFULL(m);
+        }
     }
-    return mask;
+    for (u = 0; u < OMAP2_MBOX_USERS; u++) {
+        s->irqstatus[u] = bits;
+    }
+    omap2_mailbox_irq_update(s);
 }
 
 static void omap2_mailbox_reset(struct omap2_mailbox_s *s)
 {
     int i;
-    uint32_t idle_notfull = omap2_mailbox_idle_notfull_mask();
 
     s->sysconfig = 0;
     for (i = 0; i < OMAP2_MBOX_USERS; i++) {
-        /* Silicon golden: IRQSTATUS idle = 0xaaa after EN_MAILBOXES; not 0. */
-        s->irqstatus[i] = idle_notfull;
         s->irqenable[i] = 0;
     }
     memset(s->fifo, 0, sizeof(s->fifo));
-    memset(s->msg_partial, 0, sizeof(s->msg_partial));
+    memset(s->msg_hold, 0, sizeof(s->msg_hold));
     memset(s->msg_latched, 0, sizeof(s->msg_latched));
     memset(s->msg_read_half, 0, sizeof(s->msg_read_half));
     omap2_mbox_a2d_hist_n = 0;
     omap2_mbox_a2d_hist_i = 0;
     omap2_mbox_last_a2d_valid = 0;
     omap2_mbox_last_d2a_valid = 0;
-    omap2_mailbox_irq_update(s);
+    omap2_mailbox_sync_status(s);
 }
 
 static uint32_t omap2_mailbox_pop(struct omap2_mailbox_s *s, unsigned m)
 {
     struct omap2_mailbox_fifo *f = &s->fifo[m];
     uint32_t value;
-    unsigned was_full;
 
     if (!f->count) {
         return 0;
     }
-    was_full = f->count == OMAP2_MBOX_DEPTH;
     value = f->msg[f->ridx];
     f->ridx = (f->ridx + 1) % OMAP2_MBOX_DEPTH;
     f->count--;
     omap2_mailbox_log_word("pop", m, value, f->count);
-    if (was_full) {
-        omap2_mailbox_set_all_users(s, OMAP2_MBOX_IRQ_NOTFULL(m));
-        omap2_mailbox_irq_update(s);
-        /*
-         * `_mbx_send` may already have INTM=0 and be SEM_pending the
-         * not-full object. A level that never dropped (NEWMSG(0)
-         * still latched) would not set IFR0; pulse FIFO 1 NOTFULL
-         * the same way FIFO 0 NEWMSG is pulsed.
-         */
-        if (m == 1 && s->irq[1] &&
-            (s->irqstatus[1] & s->irqenable[1] &
-             OMAP2_MBOX_IRQ_NOTFULL(1))) {
-            qemu_set_irq(s->irq[1], 0);
-            qemu_set_irq(s->irq[1], 1);
+    if (m == 1 && (((value >> 24) & 0x7f) == 0x20)) {
+        static unsigned bksnd_pops;
+        const char *stat;
+        FILE *fstat;
+
+        if (bksnd_pops < 24) {
+            bksnd_pops++;
+            stat = getenv("N8X0_PCM_STAT");
+            if (!stat || !stat[0]) {
+                stat = "/tmp/n8x0-pcm-stat.log";
+            }
+            fstat = fopen(stat, "a");
+            if (fstat) {
+                fprintf(fstat, "pcm1-mbox-pop word=%08x depth=%u\n",
+                        value, f->count);
+                fclose(fstat);
+            }
         }
     }
+    omap2_mailbox_sync_status(s);
     return value;
 }
 
-static void omap2_mailbox_notify_newmsg(struct omap2_mailbox_s *s, unsigned m)
-{
-    omap2_mailbox_set_all_users(s, OMAP2_MBOX_IRQ_NEWMSG(m));
-    omap2_mailbox_irq_update(s);
-    /*
-     * OMAP2 NEWMSG is sticky, but tokliBIOS ACKs it in `_mbx_newmsg`
-     * after MSGSTATUS hits 0. A later ARM word (TCFG) on FIFO 0 must
-     * raise INT5 again even if the line never dropped. Do not pulse
-     * the DSP user on FIFO 1: that is the DSP's own TX path.
-     */
-    if (m == 0 && s->irq[1] && (s->irqstatus[1] & s->irqenable[1])) {
-        qemu_set_irq(s->irq[1], 0);
-        qemu_set_irq(s->irq[1], 1);
-    }
-}
-
 static void omap2_mailbox_push(struct omap2_mailbox_s *s, unsigned m,
-                               uint32_t value, bool notify)
+                               uint32_t value)
 {
     struct omap2_mailbox_fifo *f = &s->fifo[m];
     unsigned widx;
@@ -306,44 +304,30 @@ static void omap2_mailbox_push(struct omap2_mailbox_s *s, unsigned m,
     widx = (f->ridx + f->count) % OMAP2_MBOX_DEPTH;
     f->msg[widx] = value;
     f->count++;
-    if (notify) {
-        omap2_mailbox_notify_newmsg(s, m);
-    }
     omap2_mailbox_log_word("push", m, value, f->count);
+    omap2_mailbox_sync_status(s);
 }
 
 static void omap2_mailbox_write_message(struct omap2_mailbox_s *s,
                                         unsigned m, unsigned offset,
                                         uint64_t value, unsigned size)
 {
-    struct omap2_mailbox_fifo *f = &s->fifo[m];
     uint32_t half = (uint32_t)value;
 
     if (size == 4 && offset == 0) {
-        omap2_mailbox_push(s, m, (uint32_t)value, true);
-        s->msg_partial[m] = 0;
+        s->msg_hold[m] = (uint32_t)value;
+        omap2_mailbox_push(s, m, (uint32_t)value);
         return;
     }
     if (size == 2 && offset == 0) {
-        /* Slot reserved; NEWMSG waits for the LSW (or a lone +2). */
-        omap2_mailbox_push(s, m, half & 0xffff, false);
-        s->msg_partial[m] = 1;
+        /* Latch LSW only; silicon MSGSTATUS stays 0 until +2 or writel. */
+        s->msg_hold[m] = (s->msg_hold[m] & 0xffff0000u) | (half & 0xffffu);
         return;
     }
     if (size == 2 && offset == 2) {
-        if (s->msg_partial[m] && f->count) {
-            unsigned widx = (f->ridx + f->count - 1) % OMAP2_MBOX_DEPTH;
-            uint32_t first = f->msg[widx] & 0xffffu;
-
-            /* Stock MOV dbl: first 16-bit write is MSW, second is LSW. */
-            f->msg[widx] = (first << 16) | (half & 0xffffu);
-            s->msg_partial[m] = 0;
-            omap2_mailbox_log_word("complete", m, f->msg[widx], f->count);
-            omap2_mailbox_notify_newmsg(s, m);
-            return;
-        }
-        omap2_mailbox_push(s, m, (half & 0xffffu) << 16, true);
-        s->msg_partial[m] = 0;
+        s->msg_hold[m] = (s->msg_hold[m] & 0xffffu) |
+                         ((half & 0xffffu) << 16);
+        omap2_mailbox_push(s, m, s->msg_hold[m]);
         return;
     }
     qemu_log_mask(LOG_GUEST_ERROR,
@@ -411,7 +395,23 @@ static uint64_t omap2_mailbox_read(void *opaque, hwaddr addr, unsigned size)
         return s->fifo[index].count >= OMAP2_MBOX_DEPTH;
     }
     if (addr >= OMAP2_MBOX_MSGSTATUS(0) && addr <= OMAP2_MBOX_MSGSTATUS(5)) {
+        static unsigned msg_logs;
         index = (addr - OMAP2_MBOX_MSGSTATUS(0)) / 4;
+        if (index == 1 && s->fifo[1].count && msg_logs < 12u) {
+            const char *stat = getenv("N8X0_PCM_STAT");
+            FILE *f;
+
+            msg_logs++;
+            if (!stat || !stat[0]) {
+                stat = "/tmp/n8x0-pcm-stat.log";
+            }
+            f = fopen(stat, "a");
+            if (f) {
+                fprintf(f, "pcm1-msgstatus-read count=%u\n",
+                        s->fifo[1].count);
+                fclose(f);
+            }
+        }
         return s->fifo[index].count;
     }
     if (addr >= OMAP2_MBOX_IRQSTATUS(0) && addr <= OMAP2_MBOX_IRQENABLE(3)) {
@@ -465,11 +465,16 @@ static void omap2_mailbox_write(void *opaque, hwaddr addr,
     if (addr >= OMAP2_MBOX_IRQSTATUS(0) && addr <= OMAP2_MBOX_IRQENABLE(3)) {
         index = (addr - OMAP2_MBOX_IRQSTATUS(0)) / 8;
         if (((addr - OMAP2_MBOX_IRQSTATUS(0)) & 7) == 0) {
-            s->irqstatus[index] &= ~value;
+            /*
+             * TYPE2 W1C. NEWMSG/NOTFULL are occupancy: a W1C while
+             * MSGSTATUS>0 cannot drop NEWMSG (ACK-vs-late-push).
+             */
+            (void)value;
+            omap2_mailbox_sync_status(s);
         } else {
             s->irqenable[index] = value;
+            omap2_mailbox_irq_update(s);
         }
-        omap2_mailbox_irq_update(s);
         return;
     }
 

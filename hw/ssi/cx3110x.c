@@ -9,15 +9,24 @@
  *
  * This stub implements the SPI address/data framing from Linux
  * drivers/net/wireless/intersil/p54/p54spi.c, accepts firmware DMA
- * writes, latches HOST_INT_READY after RAM_BOOT, and answers SoftMAC
- * LMAC traffic with a synthetic BSS so wlancond can list a network
- * (QEMU-WLAN-CX3110X-001). It does not run the real ARM firmware image.
+ * writes, latches HOST_INT_READY after RAM_BOOT, and answers Maemo
+ * SoftMAC scans with two access points (QEMU-WLAN-CX3110X-001). The
+ * open AP forwards IPv4 after association. The weaker AP advertises
+ * WPA and rejects joins. Real 3826.arm is not executed.
  */
 
 #include "qemu/osdep.h"
+#include "qemu/error-report.h"
 #include "qemu/log.h"
 #include "hw/irq.h"
 #include "hw/ssi/cx3110x.h"
+#ifndef CX3110X_NO_NET
+#include "qemu/timer.h"
+#include "qemu/main-loop.h"
+#include "qemu/sockets.h"
+#include <fcntl.h>
+#include <errno.h>
+#endif
 
 /* p54spi.h register addresses (byte offsets in the SPI window) */
 #define SPI_ADRS_ARM_INTERRUPTS     0x00
@@ -52,21 +61,28 @@
 #define SPI_HOST_INT_SW_UPDATE     0x00000004
 #define SPI_HOST_INT_UPDATE        0x10000000
 
-/* p54 LMAC control header (LE) — enough to spot SCAN and echo req_id. */
+/* SoftMAC control header (LE) — enough to spot SCAN and echo req_id. */
 #define P54_HDR_FLAG_CONTROL        0x8000
-#define P54_HDR_FLAG_CONTROL_OPSET  0x8001
 #define P54_CONTROL_TYPE_SCAN       1
-#define P54_CONTROL_TYPE_TRAP       2
-#define P54_TRAP_SCAN               0
 
-#define CX3110X_RX_MAX              512
+#define CX3110X_RX_MAX              2048
 #define CX3110X_TX_CAP              4096
-#define CX3110X_RX_QUEUE            4
+#define CX3110X_RX_QUEUE            8
+#define CX3110X_FLOWS               24
+
+/* umac_frame_rx: dBm = (payload[8] >> 1) - 110. */
+#define CX_RSSI_STRONG              140 /* -40 dBm */
+#define CX_RSSI_WEAK                70  /* -75 dBm */
+#define CX_GUEST_IP                 0x0a00020fU /* 10.0.2.15 */
+#define CX_GW_IP                    0x0a000202U /* 10.0.2.2 */
+#define CX_DNS_IP                   0x0a000203U /* 10.0.2.3 */
 
 struct cx3110x_rx_frame {
     uint8_t data[CX3110X_RX_MAX];
     uint32_t len;
 };
+
+struct cx_flow;
 
 struct cx3110x_s {
     qemu_irq irq;
@@ -84,6 +100,18 @@ struct cx3110x_s {
     uint8_t tx_buf[CX3110X_TX_CAP];
     uint32_t tx_len;
     bool booted;
+    bool bss_announced;
+    int tx_logged;
+    int joined; /* index into cx_aps, or -1 */
+    uint8_t sta[6];
+    bool sta_known;
+    uint16_t dot11_seq;
+#ifndef CX3110X_NO_NET
+    QEMUTimer *announce_timer;
+    int announce_left;
+    uint32_t dns_host;
+    struct cx_flow *flows;
+#endif
 
     /* SoftMAC RX queue: each entry is [u16 le length][payload…] */
     struct cx3110x_rx_frame rxq[CX3110X_RX_QUEUE];
@@ -158,6 +186,7 @@ static void cx3110x_rx_queue(struct cx3110x_s *s, const uint8_t *payload,
         s->rx_pos = 0;
     }
     cx3110x_raise(s, SPI_HOST_INT_UPDATE | SPI_HOST_INT_SW_UPDATE);
+    s->win[SPI_ADRS_GEN_PURP_1] = plen;
 }
 
 static void cx3110x_rx_advance(struct cx3110x_s *s)
@@ -170,152 +199,92 @@ static void cx3110x_rx_advance(struct cx3110x_s *s)
     s->rx_pos = 0;
     if (s->rx_count == 0) {
         cx3110x_ack(s, SPI_HOST_INT_UPDATE | SPI_HOST_INT_SW_UPDATE);
+        s->win[SPI_ADRS_GEN_PURP_1] = 0;
     } else {
+        s->win[SPI_ADRS_GEN_PURP_1] =
+            (s->rxq[s->rx_head].len >= 2) ? (s->rxq[s->rx_head].len - 2) : 0;
         cx3110x_raise(s, SPI_HOST_INT_UPDATE | SPI_HOST_INT_SW_UPDATE);
     }
 }
 
-static void cx3110x_synth_scan_trap(struct cx3110x_s *s, uint32_t req_id)
+/*
+ * Maemo umac does the scan on the host. Each channel step is an
+ * fw_ctrl submit: DMA_WRITE_BASE is the kernel request object, and the
+ * payload's first halfword is negative. prism_interconnect_message_handle
+ * only calls fw_ctrl_accept when bit 0 is set on that halfword, and the
+ * accept path matches the request via the word at payload offset 4.
+ * Without 0x8001 the FSM stalls after one channel, the 512-jiffy timer
+ * fires, and sm_drv_close prints "shut down softmac".
+ */
+static void cx3110x_complete_ctrl(struct cx3110x_s *s)
 {
-    /*
-     * Minimal p54 control trap: SCAN complete on channel 2412 MHz.
-     * Maemo SoftMAC / Linux p54 both key off CONTROL|TRAP + P54_TRAP_SCAN.
-     * A follow-up data RX with a beacon is future work if the UI still
-     * shows an empty list after the trap.
-     */
-    uint8_t frame[16];
-    uint16_t flags = P54_HDR_FLAG_CONTROL;
-    uint16_t len = sizeof(frame);
-    uint16_t type = P54_CONTROL_TYPE_TRAP;
-    uint16_t event = P54_TRAP_SCAN;
-    uint16_t freq = 2412;
+    uint32_t req;
+    uint16_t flags;
+    uint8_t resp[12];
 
-    memset(frame, 0, sizeof(frame));
-    frame[0] = flags & 0xff;
-    frame[1] = flags >> 8;
-    frame[2] = len & 0xff;
-    frame[3] = len >> 8;
-    frame[4] = req_id & 0xff;
-    frame[5] = (req_id >> 8) & 0xff;
-    frame[6] = (req_id >> 16) & 0xff;
-    frame[7] = (req_id >> 24) & 0xff;
-    frame[8] = type & 0xff;
-    frame[9] = type >> 8;
-    frame[12] = event & 0xff;
-    frame[13] = event >> 8;
-    frame[14] = freq & 0xff;
-    frame[15] = freq >> 8;
-    cx3110x_rx_queue(s, frame, sizeof(frame));
-}
-
-static void cx3110x_synth_bss_rx(struct cx3110x_s *s, uint32_t req_id)
-{
-    /*
-     * Synthetic 802.11 beacon-like LMAC RX: p54_hdr (data) + p54_rx_data
-     * + a short beacon body with SSID "QEMU-N8x0".
-     */
-    uint8_t frame[128];
-    uint16_t flags = 0; /* data frame */
-    uint16_t hdr_len;
-    const char *ssid = "QEMU-N8x0";
-    size_t ssid_len = strlen(ssid);
-    uint8_t *p;
-    size_t beacon_len;
-
-    memset(frame, 0, sizeof(frame));
-    /* p54_hdr */
-    frame[0] = flags & 0xff;
-    frame[1] = flags >> 8;
-    /* len filled below */
-    frame[4] = req_id & 0xff;
-    frame[5] = (req_id >> 8) & 0xff;
-    frame[6] = (req_id >> 16) & 0xff;
-    frame[7] = (req_id >> 24) & 0xff;
-    /* type unused for data */
-    /* p54_rx_data at offset 12 */
-    p = frame + 12;
-    p[0] = 0x08; /* DATA_IN_BEACON | FCS_GOOD-ish */
-    p[1] = 0x00;
-    p[2] = 20; /* len of 802.11 hdr+body approx, filled later */
-    p[3] = 0;
-    p[4] = 0x6c; /* freq 2412 */
-    p[5] = 0x09;
-    p[6] = 1; /* antenna */
-    p[7] = 0; /* rate */
-    p[8] = 40; /* rssi */
-    p[9] = 70; /* quality */
-    p[14] = 0x42; /* tsf lo */
-    p[15] = 0x00;
-    /* align[] then 802.11 mac hdr + tagged SSID */
-    p = frame + 12 + 20;
-    /* Frame Control: beacon */
-    p[0] = 0x80;
-    p[1] = 0x00;
-    /* duration */
-    p[2] = 0;
-    p[3] = 0;
-    /* addr1 broadcast */
-    memset(p + 4, 0xff, 6);
-    /* addr2 / addr3 BSSID */
-    p[10] = 0x02;
-    p[11] = 0x00;
-    p[12] = 0x00;
-    p[13] = 0x11;
-    p[14] = 0x22;
-    p[15] = 0x33;
-    memcpy(p + 16, p + 10, 6);
-    /* seq */
-    p[22] = 0x10;
-    p[23] = 0x00;
-    /* fixed beacon params: timestamp(8) beacon_int(2) cap(2) */
-    memset(p + 24, 0, 8);
-    p[32] = 100; /* 100 TU */
-    p[33] = 0;
-    p[34] = 0x01; /* ESS */
-    p[35] = 0x00;
-    /* SSID IE */
-    p[36] = 0;
-    p[37] = ssid_len;
-    memcpy(p + 38, ssid, ssid_len);
-    /* DS param IE: channel 1 */
-    p[38 + ssid_len] = 3;
-    p[39 + ssid_len] = 1;
-    p[40 + ssid_len] = 1;
-
-    beacon_len = 41 + ssid_len;
-    hdr_len = 12 + 20 + beacon_len;
-    if (hdr_len > sizeof(frame)) {
+    if (s->tx_len < 2) {
         return;
     }
-    frame[2] = hdr_len & 0xff;
-    frame[3] = hdr_len >> 8;
-    frame[12 + 2] = beacon_len & 0xff;
-    frame[12 + 3] = beacon_len >> 8;
-    cx3110x_rx_queue(s, frame, hdr_len);
+    flags = s->tx_buf[0] | ((uint16_t)s->tx_buf[1] << 8);
+    if (!(flags & 0x8000)) {
+        return;
+    }
+    req = (uint32_t)s->win[SPI_ADRS_DMA_WRITE_BASE] |
+          ((uint32_t)s->win[SPI_ADRS_DMA_WRITE_BASE + 2] << 16);
+    if (req < 0xc0000000u) {
+        return;
+    }
+    memset(resp, 0, sizeof(resp));
+    /* Negative halfword with bit 0 set → fw_ctrl_accept. */
+    resp[0] = 0x01;
+    resp[1] = 0x80;
+    resp[4] = req & 0xff;
+    resp[5] = (req >> 8) & 0xff;
+    resp[6] = (req >> 16) & 0xff;
+    resp[7] = (req >> 24) & 0xff;
+    cx3110x_rx_queue(s, resp, sizeof(resp));
 }
+
+#include "cx3110x-wlan.inc"
 
 static void cx3110x_handle_host_tx(struct cx3110x_s *s)
 {
     uint16_t flags, type;
     uint32_t req_id;
 
-    if (!s->booted || s->tx_len < 12) {
+    if (!s->booted || s->tx_len < 2) {
         return;
+    }
+    if (s->tx_logged < 4) {
+        info_report("cx3110x: host tx %u bytes %02x %02x %02x %02x base=%08x",
+                    s->tx_len,
+                    s->tx_buf[0],
+                    s->tx_len > 1 ? s->tx_buf[1] : 0,
+                    s->tx_len > 2 ? s->tx_buf[2] : 0,
+                    s->tx_len > 3 ? s->tx_buf[3] : 0,
+                    (uint32_t)s->win[SPI_ADRS_DMA_WRITE_BASE] |
+                    ((uint32_t)s->win[SPI_ADRS_DMA_WRITE_BASE + 2] << 16));
+        s->tx_logged++;
     }
     flags = s->tx_buf[0] | ((uint16_t)s->tx_buf[1] << 8);
-    if (!(flags & P54_HDR_FLAG_CONTROL)) {
-        return;
+    if ((flags & P54_HDR_FLAG_CONTROL) && s->tx_len >= 12) {
+        req_id = s->tx_buf[4] | ((uint32_t)s->tx_buf[5] << 8) |
+                 ((uint32_t)s->tx_buf[6] << 16) |
+                 ((uint32_t)s->tx_buf[7] << 24);
+        type = s->tx_buf[8] | ((uint16_t)s->tx_buf[9] << 8);
+        if (type == P54_CONTROL_TYPE_SCAN) {
+            qemu_log("cx3110x: SoftMAC SCAN req_id=0x%x — umac BSS\n",
+                     req_id);
+        }
     }
-    req_id = s->tx_buf[4] | ((uint32_t)s->tx_buf[5] << 8) |
-             ((uint32_t)s->tx_buf[6] << 16) | ((uint32_t)s->tx_buf[7] << 24);
-    type = s->tx_buf[8] | ((uint16_t)s->tx_buf[9] << 8);
-
-    if (type == P54_CONTROL_TYPE_SCAN) {
-        qemu_log("cx3110x: SoftMAC SCAN req_id=0x%x — synthetic BSS\n",
-                 req_id);
-        cx3110x_synth_bss_rx(s, req_id);
-        cx3110x_synth_scan_trap(s, req_id);
+    /* Accept must precede beacons so fw_ctrl unblocks the scan FSM first. */
+    cx3110x_complete_ctrl(s);
+    if ((flags & 0x8000) && s->joined < 0) {
+        s->bss_announced = false;
+        cx_announce(s);
+        cx_announce_arm(s);
     }
+    cx_scan_tx(s);
 }
 
 static uint16_t cx3110x_read16(struct cx3110x_s *s, uint8_t addr)
@@ -394,7 +363,17 @@ static void cx3110x_write16(struct cx3110x_s *s, uint8_t addr, uint16_t val)
         if ((val & SPI_CTRL_STAT_RAM_BOOT) &&
             !(prev & SPI_CTRL_STAT_RAM_BOOT)) {
             s->booted = true;
-            qemu_log("cx3110x: RAM_BOOT — HOST_INT_READY\n");
+            s->bss_announced = false;
+            s->joined = -1;
+            s->sta_known = false;
+            cx_flows_reset(s);
+#ifndef CX3110X_NO_NET
+            s->announce_left = 8;
+            if (s->announce_timer) {
+                timer_del(s->announce_timer);
+            }
+#endif
+            info_report("cx3110x: RAM_BOOT — HOST_INT_READY");
             cx3110x_raise(s, SPI_HOST_INT_READY);
         }
         if (val & SPI_CTRL_STAT_HOST_RESET) {
@@ -445,7 +424,7 @@ static void cx3110x_write16(struct cx3110x_s *s, uint8_t addr, uint16_t val)
             if (s->booted) {
                 cx3110x_handle_host_tx(s);
             } else if (s->tx_len >= 1024) {
-                qemu_log("cx3110x: firmware DMA chunk %u bytes\n", s->tx_len);
+                info_report("cx3110x: firmware DMA chunk %u bytes", s->tx_len);
             }
             cx3110x_raise(s, SPI_HOST_INT_WR_READY);
         }
@@ -454,6 +433,32 @@ static void cx3110x_write16(struct cx3110x_s *s, uint8_t addr, uint16_t val)
     default:
         s->win[addr] = val;
         break;
+    }
+}
+
+static int cx3110x_looks_like_addr(uint16_t word)
+{
+    uint8_t reg;
+
+    if ((word & 0xff) != 0 || (word >> 8) == 0) {
+        return 0;
+    }
+    reg = (word >> 8) & 0x7f;
+    return reg <= 0x3a;
+}
+
+static int cx3110x_reg_words(uint8_t addr)
+{
+    switch (addr) {
+    case SPI_ADRS_ARM_INTERRUPTS:
+    case SPI_ADRS_ARM_INT_EN:
+    case SPI_ADRS_HOST_INTERRUPTS:
+    case SPI_ADRS_HOST_INT_EN:
+    case SPI_ADRS_HOST_INT_ACK:
+    case SPI_ADRS_DMA_WRITE_BASE:
+        return 2;
+    default:
+        return 1;
     }
 }
 
@@ -481,6 +486,21 @@ uint32_t cx3110x_txrx(void *opaque, uint32_t tx, int len)
         s->selected = 1;
     }
 
+    /*
+     * McSPI only drops CS when FORCE changes. Once the current register has
+     * taken its 16- or 32-bit word, the next address-shaped word starts a
+     * new access. Do not resync mid-word (the high half of 0x10000004 is
+     * 0x1000), mid-DMA write, or mid-DMA_DATA stream read (payload halfwords
+     * ride the same CS after one address phase).
+     */
+    if (s->have_addr && s->dma_wr_remaining == 0 &&
+        s->addr != SPI_ADRS_DMA_DATA &&
+        s->data_words >= cx3110x_reg_words(s->addr) &&
+        cx3110x_looks_like_addr(word)) {
+        s->have_addr = 0;
+        s->data_words = 0;
+    }
+
     if (!s->have_addr) {
         /*
          * Address phase: (reg << 8) [| SPI_ADRS_READ_BIT_15]. Low byte is 0
@@ -502,9 +522,15 @@ uint32_t cx3110x_txrx(void *opaque, uint32_t tx, int len)
     if (s->is_read) {
         /*
          * Multi-word reads assemble LE 16-bit chunks. For a 32-bit register
-         * at even addr, words are [addr+0], [addr+2].
+         * at even addr, words are [addr+0], [addr+2]. DMA_DATA is a stream
+         * window: every word after the address phase must stay at 0x28
+         * (spi_dma_read ships address once, then N payload halfwords).
          */
-        reg = s->addr + s->data_words * 2;
+        if (s->addr == SPI_ADRS_DMA_DATA) {
+            reg = SPI_ADRS_DMA_DATA;
+        } else {
+            reg = s->addr + s->data_words * 2;
+        }
         rx = cx3110x_read16(s, reg);
         s->data_words++;
         return rx;
@@ -533,7 +559,14 @@ struct cx3110x_s *cx3110x_init(qemu_irq irq)
     struct cx3110x_s *s = g_new0(struct cx3110x_s, 1);
 
     s->irq = irq;
+    s->joined = -1;
     /* Idle device is ready for DMA. */
     s->win[SPI_ADRS_DMA_WRITE_CTRL] = HOST_ALLOWED;
+#ifndef CX3110X_NO_NET
+    s->flows = g_new0(struct cx_flow, CX3110X_FLOWS);
+    s->dns_host = cx_read_dns();
+    s->announce_left = 8;
+    s->announce_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, cx_announce_tick, s);
+#endif
     return s;
 }

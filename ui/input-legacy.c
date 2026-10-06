@@ -26,7 +26,6 @@
 #include "qemu/log.h"
 #include "qapi/qapi-commands-ui.h"
 #include "ui/console.h"
-#include "ui/surface.h"
 #include "keymaps.h"
 #include "ui/input.h"
 
@@ -199,26 +198,12 @@ static void legacy_mouse_event(DeviceState *dev, QemuConsole *src,
     case INPUT_EVENT_KIND_ABS:
         move = evt->u.abs.data;
         /*
-         * qemu_input_queue_abs normalizes to 0..0x7fff. TSC2005/TSC210x
-         * still expect framebuffer pixels (n810_pointercal is 800x480).
-         * Leaving the normalized value makes every tap land past the
-         * panel, so the Start-up wizard draws but does not take clicks.
+         * Keep the 0..0x7fff value from qemu_input_queue_abs.
+         * tsc2005_set_transform / tsc210x_set_transform treat that range
+         * as the full panel (n810_pointercal .x/.y are only the tslib
+         * screen size inside the ADC matrix). Scaling back to surface
+         * pixels makes every tap land in the top-left corner.
          */
-        if (s->qemu_put_mouse_event_absolute && src) {
-            DisplaySurface *surface = qemu_console_surface(src);
-            int max = 0;
-
-            if (surface) {
-                max = move->axis == INPUT_AXIS_X ? surface_width(surface)
-                                                 : surface_height(surface);
-            }
-            if (max > 0) {
-                s->axis[move->axis] = qemu_input_scale_axis(
-                    move->value, INPUT_EVENT_ABS_MIN, INPUT_EVENT_ABS_MAX,
-                    0, max);
-                break;
-            }
-        }
         s->axis[move->axis] = move->value;
         break;
     case INPUT_EVENT_KIND_REL:

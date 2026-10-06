@@ -71,6 +71,9 @@ struct omap_eac_s {
         uint32_t txbuf[EAC_BUF_LEN];
         int txlen;
         int txavail;
+        /* Stereo ADWR/0xb8: assemble L then R into one 32-bit AUD frame. */
+        uint16_t tx_half;
+        int tx_half_valid;
 
         int enable;
         int rate;
@@ -82,6 +85,7 @@ struct omap_eac_s {
         SWVoiceIn *in_voice;
         SWVoiceOut *out_voice;
         int hw_enable;
+        I2SCodec *slave;
     } codec;
 
     struct {
@@ -146,12 +150,187 @@ static inline void omap_eac_in_refill(struct omap_eac_s *s)
     }
 }
 
+static struct omap_eac_s *eac_flush_eac;
+static QEMUTimer *eac_flush_timer;
+static inline void omap_eac_out_empty(struct omap_eac_s *s);
+
+static void eac_flush_timer_cb(void *opaque)
+{
+    struct omap_eac_s *s = opaque;
+
+    /*
+     * A pcm1 read is blocked in the kernel. Flushing the TSC2301
+     * here burns the tick the ARM needs to finish that read.
+     */
+    if (omap2420_dsp_pcm1_flush_hold()) {
+        if (eac_flush_timer) {
+            timer_mod(eac_flush_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
+        }
+        return;
+    }
+    if (s->codec.txlen) {
+        omap_eac_out_empty(s);
+    }
+}
+
+void omap_eac_slave_postpone(void)
+{
+    int64_t now;
+
+    if (!eac_flush_timer || !timer_pending(eac_flush_timer)) {
+        return;
+    }
+    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    /*
+     * Virtual time is the host clock. AUD_write inside a kick makes
+     * the flush deadline expire before the ARM runs, and the next
+     * kick starts with FIFO1 still unread. Push that deadline out.
+     */
+    if (timer_expire_time_ns(eac_flush_timer) <= now) {
+        timer_mod(eac_flush_timer, now + 1000000);
+    }
+}
+
+static void eac_slave_flush_soon(struct omap_eac_s *s)
+{
+    if (!eac_flush_timer || eac_flush_eac != s) {
+        if (eac_flush_timer) {
+            timer_del(eac_flush_timer);
+            timer_free(eac_flush_timer);
+        }
+        eac_flush_eac = s;
+        eac_flush_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                       eac_flush_timer_cb, s);
+    }
+    timer_mod(eac_flush_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
+}
+
 static inline void omap_eac_out_empty(struct omap_eac_s *s)
 {
     int left = s->codec.txlen << 2;
     int start = 0;
     int sent = 1;
+    static uint64_t aud_bytes;
+    static unsigned aud_logs;
+    static unsigned ovf_logs;
+    static int aud_best;
+    int peak = 0;
+    int i;
 
+    for (i = 0; i < s->codec.txlen; i++) {
+        /*
+         * txbuf[] is a packed stereo frame: L in 15:0, R in 31:16.
+         * The startup path often carries the tone in only one half.
+         * Looking at the low half alone drops that buffer as idle.
+         */
+        int16_t lo = (int16_t)(s->codec.txbuf[i] & 0xffff);
+        int16_t hi = (int16_t)(s->codec.txbuf[i] >> 16);
+        int a = lo < 0 ? -lo : lo;
+        int b = hi < 0 ? -hi : hi;
+
+        if (b > a) {
+            a = b;
+        }
+        if (a > peak) {
+            peak = a;
+        }
+    }
+
+    if (s->codec.slave) {
+        int played = 0;
+
+        /*
+         * The shift register always empties. A powered-down or not-yet
+         * ready codec drops the bits, so they never reach the speaker.
+         */
+        /*
+         * Idle EAC frames are a few LSBs. Pushing them into the
+         * TSC2301 wav backend resets rate control inside the DSP
+         * kick and the pcm1 command chain stops. The startup tone
+         * is well above this.
+         */
+        /*
+         * The wake-up tune at esd's volume crests near 1300 and the
+         * body sits under 1000. Idle frames are only a few LSBs;
+         * those still stay out so they cannot reset DSP rate control.
+         */
+        if (left && s->codec.slave->tx && peak >= 32) {
+            played = s->codec.slave->tx(s->codec.slave->opaque,
+                                        (const uint8_t *)s->codec.txbuf, left);
+            if (played <= 0) {
+                static unsigned drop_logs;
+
+                if (drop_logs < 4u) {
+                    const char *stat = getenv("N8X0_PCM_STAT");
+                    FILE *f;
+
+                    if (!stat || !stat[0]) {
+                        stat = "/tmp/n8x0-pcm-stat.log";
+                    }
+                    f = fopen(stat, "a");
+                    if (f) {
+                        fprintf(f,
+                                "t=eac-drop peak=%d left=%d cts=%d tx=%d\n",
+                                peak, left, s->codec.slave->cts,
+                                s->codec.slave->tx != NULL);
+                        fclose(f);
+                    }
+                    drop_logs++;
+                }
+            }
+        }
+        /*
+         * Idle EAC chunks (peak under 32) must not use up the log.
+         * The startup tone arrives later, after cmd 2, and has to stay
+         * visible.
+         */
+        if (played > 0 && peak > 0 &&
+            ((peak >= 32 && aud_logs < 96u) || aud_logs < 8u ||
+             peak > aud_best)) {
+            const char *stat = getenv("N8X0_PCM_STAT");
+            FILE *f;
+
+            if (!stat || !stat[0]) {
+                stat = "/tmp/n8x0-pcm-stat.log";
+            }
+            f = fopen(stat, "a");
+            if (f) {
+                aud_bytes += (uint64_t)played;
+                if (peak > aud_best) {
+                    aud_best = peak;
+                }
+                fprintf(f,
+                        "eac-aud bytes=%llu chunk=%d left=%d peak=%d voice=%d\n",
+                        (unsigned long long)aud_bytes, played, left - played,
+                        peak, 1);
+                fclose(f);
+                aud_logs++;
+            }
+        }
+        if (played > 0 && played < left) {
+            int frames = played >> 2;
+            int remain;
+
+            if (frames > s->codec.txlen) {
+                frames = s->codec.txlen;
+            }
+            remain = s->codec.txlen - frames;
+            if (remain > 0 && frames > 0) {
+                memmove(s->codec.txbuf, s->codec.txbuf + frames,
+                        (size_t)remain * sizeof(s->codec.txbuf[0]));
+            }
+            s->codec.txlen = remain;
+            eac_slave_flush_soon(s);
+        } else {
+            s->codec.txlen = 0;
+        }
+        s->codec.tx_half_valid = 0;
+        s->codec.txavail = 64;
+        omap_eac_out_dmarequest_update(s);
+        return;
+    }
     while (left && (sent = AUD_write(s->codec.out_voice,
                                     (uint8_t *) s->codec.txbuf + start,
                                     left)) > 0) {	/* Be defensive */
@@ -159,16 +338,57 @@ static inline void omap_eac_out_empty(struct omap_eac_s *s)
         left -= sent;
     }
 
+    if (start > 0) {
+        aud_bytes += (uint64_t)start;
+        if (aud_logs < 64u && peak > 0) {
+            const char *stat = getenv("N8X0_PCM_STAT");
+            FILE *f;
+
+            if (!stat || !stat[0]) {
+                stat = "/tmp/n8x0-pcm-stat.log";
+            }
+            f = fopen(stat, "a");
+            if (f) {
+                fprintf(f,
+                        "eac-aud bytes=%llu chunk=%d left=%d peak=%d voice=%d\n",
+                        (unsigned long long)aud_bytes, start, left, peak,
+                        s->codec.out_voice != NULL);
+                fclose(f);
+            }
+            aud_logs++;
+        }
+    }
+
     if (!sent) {
         s->codec.txavail = 0;
         omap_eac_out_dmarequest_update(s);
     }
 
+    /*
+     * Chunked delivery: discard unsent after each flush. Full FIFO
+     * retain correlated with dsp_dld flakes; flushing every ≤64 frames
+     * (see ADWR) keeps Pulse fed without holding a giant tail.
+     */
     if (start)
         s->codec.txlen = 0;
+    else if (left > 0 && ovf_logs < 32u) {
+        const char *stat = getenv("N8X0_PCM_STAT");
+        FILE *f;
+
+        if (!stat || !stat[0]) {
+            stat = "/tmp/n8x0-pcm-stat.log";
+        }
+        f = fopen(stat, "a");
+        if (f) {
+            fprintf(f, "eac-ovf txlen=%d txavail=%d peak=%d\n",
+                    s->codec.txlen, s->codec.txavail, peak);
+            fclose(f);
+        }
+        ovf_logs++;
+    }
 }
 
-static void omap_eac_in_cb(void *opaque, int avail_b)
+static void __attribute__((unused)) omap_eac_in_cb(void *opaque, int avail_b)
 {
     struct omap_eac_s *s = opaque;
 
@@ -191,9 +411,17 @@ static void omap_eac_out_cb(void *opaque, int free_b)
 
 static void omap_eac_enable_update(struct omap_eac_s *s)
 {
+    /*
+     * Bit 1 is the OMAP1 AUDEN this model inherited. avs_kernel
+     * _Enable_DMA sets AGCTR bit 12 (DMAREN, 0x1000) or bit 11
+     * (DMAWEN) at word 0x7f0061 instead. Either means the codec
+     * DMA clock is up; the output voice has to be open or the
+     * playback FIFO is discarded.
+     */
+    int auden = (s->codec.config[1] & 2) || (s->codec.config[1] & 0x1800);
+
     s->codec.enable = !(s->codec.config[1] & 1) &&		/* EACPWD */
-            (s->codec.config[1] & 2) &&				/* AUDEN */
-            s->codec.hw_enable;
+            auden && s->codec.hw_enable;
 }
 
 static const int omap_eac_fsint[4] = {
@@ -266,30 +494,44 @@ static void omap_eac_format_update(struct omap_eac_s *s)
     }
     /* Discard what couldn't be written */
     s->codec.txlen = 0;
+    s->codec.tx_half_valid = 0;
 
     omap_eac_enable_update(s);
     if (!s->codec.enable)
         return;
 
     omap_eac_rate_update(s);
+    if (s->codec.slave) {
+        /* N800: EAC frames go to the attached TSC2301 DAC. */
+        s->codec.txavail = 64;
+        omap_eac_out_dmarequest_update(s);
+        return;
+    }
     fmt.endianness = ((s->codec.config[0] >> 8) & 1);		/* LI_BI */
-    fmt.nchannels = ((s->codec.config[0] >> 10) & 1) ? 2 : 1;	/* MN_ST */
+    /*
+     * txbuf[] is always 4-byte AUD frames (see ADWR packing). Host
+     * playback is stereo; mono guests duplicate the sample to L and R.
+     */
+    fmt.nchannels = 2;
     fmt.freq = s->codec.rate;
     /* TODO: signedness possibly depends on the CODEC hardware - or
      * does I2S specify it?  */
     /* All register writes are 16 bits so we store 16-bit samples
      * in the buffers regardless of AGCFR[B8_16] value.  */
-    fmt.fmt = AUDIO_FORMAT_U16;
+    /* AIC33 I2S is signed. U16 turns the startup tune into a DC offset. */
+    fmt.fmt = AUDIO_FORMAT_S16;
 
-    s->codec.in_voice = AUD_open_in(&s->codec.card, s->codec.in_voice,
-                    "eac.codec.in", s, omap_eac_in_cb, &fmt);
+    /*
+     * Never open capture on the host card. PipeWire/Pulse returns
+     * pa_stream_peek Bad state on an idle mic stream and that has
+     * aborted interactive boots / glitched playback. DSP→EAC TX is
+     * enough for the wake-up tune and UI sounds.
+     */
     s->codec.out_voice = AUD_open_out(&s->codec.card, s->codec.out_voice,
                     "eac.codec.out", s, omap_eac_out_cb, &fmt);
+    AUD_set_active_out(s->codec.out_voice, 1);
 
     omap_eac_volume_update(s);
-
-    AUD_set_active_in(s->codec.in_voice, 1);
-    AUD_set_active_out(s->codec.out_voice, 1);
 }
 
 static void omap_eac_reset(struct omap_eac_s *s)
@@ -329,6 +571,7 @@ static void omap_eac_reset(struct omap_eac_s *s)
     s->codec.rxoff = 0;
     s->codec.rxlen = 0;
     s->codec.txlen = 0;
+    s->codec.tx_half_valid = 0;
     s->codec.rxavail = 0;
     s->codec.txavail = 0;
 
@@ -485,7 +728,6 @@ static void omap_eac_write(void *opaque, hwaddr addr,
     case 0x0a8:	/* APD3LCR */
     case 0x0ac:	/* APD3RCR */
     case 0x0b0:	/* APD4R */
-    case 0x0b8:	/* ADRDR */
     case 0x0d0:	/* MPDDMARR */
     case 0x0d8:	/* MPUDMARR */
     case 0x0e4:	/* BPDDMARR */
@@ -566,14 +808,66 @@ static void omap_eac_write(void *opaque, hwaddr addr,
         s->att = value & 0xff;
         break;
 
+    case 0x0b8:	/* DSP playback DMA data (byte 0xfe00b8) */
+        /*
+         * avs_kernel programs IODMA CDSA to this slot for pcm
+         * playback. ARM reads stay ADRDR. A 16-bit write is one
+         * I2S sample, same path as ADWR.
+         *
+         * txbuf[] holds AUD frames of 4 bytes. Stereo (MN_ST) needs
+         * L then R packed into one uint32; bare 16-bit stores would
+         * become (sample, 0) and play as half-rate / one-sided noise.
+         * Mono is duplicated to both halves so the same 4-byte unit
+         * still matches AUD_write's txlen<<2 sizing.
+         */
     case 0x0b4:	/* ADWR */
+        if ((s->codec.config[0] >> 10) & 1) {		/* MN_ST */
+            if (!s->codec.tx_half_valid) {
+                s->codec.tx_half = value & 0xffff;
+                s->codec.tx_half_valid = 1;
+                break;
+            }
+            value = s->codec.tx_half | ((value & 0xffff) << 16);
+            s->codec.tx_half_valid = 0;
+        } else {
+            value = (value & 0xffff) | ((value & 0xffff) << 16);
+        }
         s->codec.txbuf[s->codec.txlen ++] = value;
+        if (s->codec.slave) {
+            /*
+             * AUD_write inside the DSP kick advances the virtual clock
+             * and the next kick fires before the ARM pops FIFO1.
+             * Hold the frames and let a 1 ms timer hand them to the
+             * TSC2301 after the kick returns. Flush early only so
+             * txbuf cannot wrap.
+             */
+            if (s->codec.txlen >= EAC_BUF_LEN &&
+                omap2420_dsp_pcm1_flush_hold()) {
+                s->codec.txlen--;
+            } else if (s->codec.txlen >= (EAC_BUF_LEN - 64) &&
+                       !omap2420_dsp_pcm1_flush_hold()) {
+                omap_eac_out_empty(s);
+            } else {
+                eac_slave_flush_soon(s);
+            }
+            break;
+        }
+        /*
+         * Flush in ≤64-frame chunks so Pulse can drain during a long
+         * IODMA block instead of one giant discard at txavail.
+         */
+        if (s->codec.txavail && s->codec.txlen >= 64 &&
+            s->codec.txlen != s->codec.txavail &&
+            s->codec.txlen != EAC_BUF_LEN) {
+            omap_eac_out_empty(s);
+        }
         if (unlikely(s->codec.txlen == EAC_BUF_LEN ||
                                 s->codec.txlen == s->codec.txavail)) {
             if (s->codec.txavail)
                 omap_eac_out_empty(s);
             /* Discard what couldn't be written */
             s->codec.txlen = 0;
+            s->codec.tx_half_valid = 0;
         }
         break;
 
@@ -631,6 +925,12 @@ static struct omap_eac_s *omap_eac_init(struct omap_target_agent_s *ta,
     if (current_machine->audiodev) {
         s->codec.card.name = g_strdup(current_machine->audiodev);
         s->codec.card.state = audio_state_by_name(s->codec.card.name, &error_fatal);
+        /*
+         * No separate functional-clock object. The voice stays shut
+         * unless -audiodev was given, so a headless boot cannot open
+         * the default backend. _Enable_DMA's AGCTR write opens it.
+         */
+        s->codec.hw_enable = 1;
     }
     AUD_register_card("OMAP EAC", &s->codec.card, &error_fatal);
 
@@ -639,6 +939,43 @@ static struct omap_eac_s *omap_eac_init(struct omap_target_agent_s *ta,
     omap_l4_attach(ta, 0, &s->iomem);
 
     return s;
+}
+
+static struct omap_eac_s *eac_attached;
+
+void omap_eac_attach_codec(struct omap_eac_s *s, I2SCodec *codec)
+{
+    s->codec.slave = codec;
+    eac_attached = s;
+}
+
+int omap_eac_playback_ready(void)
+{
+    /*
+     * n810 qtest has no I2S slave; the EAC card is the sink.
+     * n800 attaches the TSC2301, and CTS stays clear until DAPD
+     * has been clear for 100 ms.
+     */
+    if (!eac_attached || !eac_attached->codec.slave) {
+        return 1;
+    }
+    return eac_attached->codec.slave->cts != 0;
+}
+
+int omap_eac_dma_enabled(void)
+{
+    uint16_t agctr;
+
+    if (!eac_attached) {
+        return 0;
+    }
+    /*
+     * Bit 1 is the inherited AUDEN. avs_kernel _Enable_DMA sets
+     * DMAREN (bit 12) or DMAWEN (bit 11) and leaves bit 1 clear.
+     * Same condition as omap_eac_enable_update().
+     */
+    agctr = eac_attached->codec.config[1];
+    return (agctr & 2) || (agctr & 0x1800);
 }
 
 /* STI/XTI (emulation interface) console - reverse engineered only */
@@ -1746,9 +2083,18 @@ static void omap_prcm_write(void *opaque, hwaddr addr,
         s->clkctrl[3] = value & 0x101;
         break;
     case 0x850:	/* RM_RSTCTRL_DSP */
-        s->rstctrl_dsp = value & 7;
-        if (s->dsp) {
-            omap2420_dsp_set_rst1(s->dsp, value & 1);
+        {
+            uint32_t prev = s->rstctrl_dsp;
+            uint32_t next = value & 7;
+
+            s->rstctrl_dsp = next;
+            if (s->dsp) {
+                omap2420_dsp_set_rst1(s->dsp, next & 1);
+                /* RST2 resets the DSP MMU. A core-only RST1 leaves it. */
+                if ((next & 2) && !(prev & 2)) {
+                    omap2420_dsp_assert_rst2(s->dsp);
+                }
+            }
         }
         break;
     case 0x858:	/* RM_RSTST_DSP */

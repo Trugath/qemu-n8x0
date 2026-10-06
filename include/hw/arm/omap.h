@@ -91,6 +91,35 @@ DECLARE_INSTANCE_CHECKER(OMAPIntcState, OMAP_INTC, TYPE_OMAP_INTC)
  */
 void omap_intc_set_iclk(OMAPIntcState *intc, omap_clk clk);
 void omap_intc_set_fclk(OMAPIntcState *intc, omap_clk clk);
+/* Bank 0 ITR/MIR, new_agr[0], SIR_IRQ, and whether the CPU is halted. */
+void omap2_intc_mpu_snapshot(uint32_t *itr, uint32_t *mir, uint32_t *agr,
+                             int *sir, int *halted);
+/* Line 26 rose while NEWIRQAGR was clear and the CPU was still running. */
+int omap2_intc_rearm_halted_mail(void);
+void omap_eac_slave_postpone(void);
+/* TSC2301 CTS: DAC powered and past the post-DAPD settle window. */
+int omap_eac_playback_ready(void);
+/* AGCTR.AUDEN. Clear means the EAC playback path was never opened. */
+int omap_eac_dma_enabled(void);
+int omap2420_dsp_pcm1_read_pending(void);
+int omap2420_dsp_pcm1_flush_hold(void);
+void omap2420_dsp_after_host_audio(void);
+/* FIFO1 still pending after NEWIRQAGR; raise MAIL_U0 again. */
+void omap2_intc_deliver_stuck_mail(void);
+/* pcm1 read() entered or returned. The DSP slice re-arms a stuck FIFO1. */
+void omap2420_dsp_pcm1_read_entered(uint32_t nbytes);
+void omap2420_dsp_pcm1_read_finished(void);
+void omap2420_dsp_pcm1_n2_finished(void);
+void omap2420_dsp_pcm1_read_result(uint32_t nbytes, uint32_t got,
+                                   const uint8_t *buf, uint32_t n);
+/* esd just filled the pcm1 mmap. Publish those bytes at DSP 0x218000. */
+void omap2420_dsp_pcm1_sync_mmap(const uint8_t *bytes, uint32_t n);
+int omap2420_dsp_pcm1_tune_armed(void);
+int omap2420_dsp_pcm1_tune_next(int16_t *sample);
+uint32_t omap2420_dsp_pcm1_tune_take(uint8_t *out, uint32_t n);
+/* True once esd_send_file has queued PCM. The wav backend records that. */
+int omap2420_dsp_pcm1_capture(void);
+void omap2420_dsp_on_wfi(void);
 
 /* omap_i2c.c */
 #define TYPE_OMAP_I2C "omap_i2c"
@@ -757,6 +786,9 @@ struct I2SCodec {
      * master and generates its own clock.  */
     void (*set_rate)(void *opaque, int in, int out);
 
+    /* Playback frames from EAC/McBSP. 0 means the DAC is not consuming. */
+    int (*tx)(void *opaque, const uint8_t *pcm, int bytes);
+
     void (*tx_swallow)(void *opaque);
     qemu_irq rx_swallow;
     qemu_irq tx_start;
@@ -775,6 +807,9 @@ struct I2SCodec {
 };
 struct omap_mcbsp_s;
 void omap_mcbsp_i2s_attach(struct omap_mcbsp_s *s, I2SCodec *slave);
+
+struct omap_eac_s;
+void omap_eac_attach_codec(struct omap_eac_s *s, I2SCodec *codec);
 
 void omap_tap_init(struct omap_target_agent_s *ta,
                 struct omap_mpu_state_s *mpu);
@@ -800,6 +835,7 @@ struct omap2420_dsp_s *omap2420_dsp_init(MemoryRegion *sysmem,
                                          qemu_irq irq_mmu);
 void omap2420_dsp_reset(struct omap2420_dsp_s *s);
 void omap2420_dsp_set_rst1(struct omap2420_dsp_s *s, int asserted);
+void omap2420_dsp_assert_rst2(struct omap2420_dsp_s *s);
 
 /* omap_lcdc.c */
 struct omap_lcd_panel_s;

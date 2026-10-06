@@ -13,6 +13,7 @@
 #include "cpu-features.h"
 #include "cpregs.h"
 #include "exec/exec-all.h"
+#include "exec/cpu_ldst.h"
 #include "exec/tb-flush.h"
 #include "exec/helper-proto.h"
 #include "sysemu/tcg.h"
@@ -1550,6 +1551,8 @@ static void user_trace_maybe_mem(CPUARMState *env, const char *why, bool force)
     }
 }
 
+void omap2420_dsp_pcm1_sync_mmap(const uint8_t *bytes, uint32_t n);
+
 void HELPER(user_trace_pc)(CPUARMState *env, uint32_t pc)
 {
     CPUState *cs = env_cpu(env);
@@ -1561,6 +1564,20 @@ void HELPER(user_trace_pc)(CPUARMState *env, uint32_t pc)
     unsigned words = user_trace_pc_stack_words();
     unsigned code_words = user_trace_pc_code_words();
     unsigned i;
+
+    /*
+     * libesd esd_send_file, the bl write. r1 is the afReadFrames PCM
+     * and r2 is the byte count, before esd mixes it into a held pair.
+     */
+    if (pc == 0x41e9c85cu) {
+        uint32_t n = env->regs[2];
+        uint8_t pcm[0x2000];
+
+        if (n >= 16u && n <= sizeof(pcm) &&
+            cpu_memory_rw_debug(cs, env->regs[1], pcm, n, false) == 0) {
+            omap2420_dsp_pcm1_sync_mmap(pcm, n);
+        }
+    }
 
     if (!user_trace_allow_as(pc, ttbr0, asid)) {
         g_string_free(msg, TRUE);
@@ -1728,6 +1745,111 @@ static void user_trace_iov_first(CPUState *cs, uint32_t iov_addr,
     }
 }
 
+/*
+ * cpu_memory_rw_debug faults on an access-flag or domain check that the
+ * running SVC return does not. The short-descriptor walk below ignores
+ * those checks and reads the translated RAM.
+ */
+static bool user_trace_va_to_phys(CPUARMState *env, uint32_t va, hwaddr *pa)
+{
+    uint32_t tcr = (uint32_t)env->cp15.tcr_el[1];
+    int maskshift = tcr & 7;
+    uint32_t mask = ~((uint32_t)0xffffffffu >> maskshift);
+    uint32_t table;
+    uint32_t desc;
+    uint32_t type;
+
+    if (va & mask) {
+        table = (uint32_t)env->cp15.ttbr1_el[1] & 0xffffc000u;
+    } else {
+        uint32_t base_mask = ~((uint32_t)0x3fffu >> maskshift);
+
+        table = (uint32_t)env->cp15.ttbr0_el[1] & base_mask;
+    }
+    table |= (va >> 18) & 0x3ffc;
+    cpu_physical_memory_read(table, &desc, 4);
+    type = desc & 3u;
+    if (type == 0) {
+        return false;
+    }
+    if (type != 1) {
+        if (desc & (1u << 18)) {
+            *pa = (desc & 0xff000000u) | (va & 0x00ffffffu);
+        } else {
+            *pa = (desc & 0xfff00000u) | (va & 0x000fffffu);
+        }
+        return true;
+    }
+    table = (desc & 0xfffffc00u) | ((va >> 10) & 0x3fcu);
+    cpu_physical_memory_read(table, &desc, 4);
+    type = desc & 3u;
+    if (type == 0) {
+        return false;
+    }
+    if (type == 1) {
+        *pa = (desc & 0xffff0000u) | (va & 0xffffu);
+    } else {
+        *pa = (desc & 0xfffff000u) | (va & 0xfffu);
+    }
+    return true;
+}
+
+uint32_t user_trace_arch_copy(uint32_t addr, void *buf, uint32_t len)
+{
+    uint8_t *out = buf;
+    uint32_t i = 0;
+
+    CPUState *cs = current_cpu ? current_cpu : first_cpu;
+
+    if (!cs || !addr || !len || !out) {
+        return 0;
+    }
+    while (i < len) {
+        hwaddr pa;
+        uint32_t chunk = len - i;
+        uint32_t page_left = 0x1000u - ((addr + i) & 0xfffu);
+
+        if (!user_trace_va_to_phys(&ARM_CPU(cs)->env, addr + i, &pa)) {
+            if (addr == 0x41ea0b28u && i == 0) {
+                CPUARMState *env = &ARM_CPU(cs)->env;
+                uint32_t ttbr = (uint32_t)env->cp15.ttbr0_el[1] & 0xffffc000u;
+                uint32_t slot = ttbr | ((addr >> 18) & 0x3ffc);
+                uint32_t l1 = 0;
+                uint32_t l2 = 0;
+                int idx = cpu_mmu_index(cs, false);
+                void *host;
+
+                cpu_physical_memory_read(slot, &l1, 4);
+                if ((l1 & 3u) == 1) {
+                    uint32_t l2addr = (l1 & 0xfffffc00u) | ((addr >> 10) & 0x3fcu);
+
+                    cpu_physical_memory_read(l2addr, &l2, 4);
+                }
+                host = tlb_vaddr_to_host(env, addr, MMU_DATA_LOAD, idx);
+                fprintf(stderr,
+                        "cmd2-pte slot=%08x l1=%08x l2=%08x idx=%d host=%p\n",
+                        slot, l1, l2, idx, host);
+                if (host) {
+                    memcpy(out, host, len < 4 ? len : 4);
+                    i = len < 4 ? len : 4;
+                    break;
+                }
+            }
+            break;
+        }
+        if (chunk > page_left) {
+            chunk = page_left;
+        }
+        cpu_physical_memory_read(pa, out + i, chunk);
+        i += chunk;
+    }
+    if ((addr & 0xfffff000u) == 0x41ea0000u && len >= 4 && i >= 4) {
+        fprintf(stderr, "user-trace-arch-copy va=%08x len=%u n=%u bytes=%02x%02x%02x%02x\n",
+                addr, len, i, out[0], out[1], out[2], out[3]);
+    }
+    return i;
+}
+
 static uint32_t user_trace_copy_guest(CPUState *cs, uint32_t addr, uint32_t len,
                                       uint8_t *out, uint32_t cap)
 {
@@ -1739,8 +1861,61 @@ static uint32_t user_trace_copy_guest(CPUState *cs, uint32_t addr, uint32_t len,
     }
     for (i = 0; i < n; i++) {
         if (cpu_memory_rw_debug(cs, addr + i, &out[i], 1, false) != 0) {
+            break;
+        }
+    }
+    if (i == n && n >= 4) {
+        static unsigned walk_ok_logs;
+        hwaddr pa;
+
+        if (walk_ok_logs < 3 &&
+            user_trace_va_to_phys(&ARM_CPU(cs)->env, addr, &pa)) {
+            uint8_t b;
+
+            cpu_physical_memory_read(pa, &b, 1);
+            fprintf(stderr, "user-trace-walk ok va=%08x pa=%08x b=%02x dbg=%02x\n",
+                    addr, (uint32_t)pa, b, out[0]);
+            walk_ok_logs++;
+        }
+    }
+    while (i < n) {
+        CPUARMState *env = &ARM_CPU(cs)->env;
+        hwaddr pa;
+        uint32_t chunk = n - i;
+        uint32_t page_left = 0x1000u - ((addr + i) & 0xfffu);
+
+        if (!user_trace_va_to_phys(env, addr + i, &pa)) {
+            static unsigned walk_logs;
+
+            if ((walk_logs < 4 && n <= 16) ||
+                ((addr + i) >= 0x41ea0000u && (addr + i) < 0x41eb0000u)) {
+                uint32_t tcr = (uint32_t)env->cp15.tcr_el[1];
+                uint32_t ttbr = (uint32_t)env->cp15.ttbr0_el[1] & 0xffffc000u;
+                uint32_t slot = ttbr | (((addr + i) >> 18) & 0x3ffc);
+                uint32_t desc = 0;
+
+                cpu_physical_memory_read(slot, &desc, 4);
+                if ((addr + i) < 0x41ea0000u || (addr + i) >= 0x41eb0000u) {
+                    if (walk_logs >= 4) {
+                        return i;
+                    }
+                    walk_logs++;
+                }
+                fprintf(stderr,
+                        "user-trace-walk miss va=%08x slot=%08x desc=%08x "
+                        "tcr=%08x ttbr0=%08x\n",
+                        addr + i, slot, desc, tcr, ttbr);
+                if ((addr + i) >= 0x41ea0000u && (addr + i) < 0x41eb0000u) {
+                    return i;
+                }
+            }
             return i;
         }
+        if (chunk > page_left) {
+            chunk = page_left;
+        }
+        cpu_physical_memory_read(pa, out + i, chunk);
+        i += chunk;
     }
     return n;
 }
@@ -1911,6 +2086,13 @@ void HELPER(user_trace_svc)(CPUARMState *env, uint32_t pc)
     bool is_write = user_trace_syscall_is_write(nr);
     bool sock_io;
     bool bme;
+    /* esd_send_file cave: setsockopt/send/nanosleep. send is not on
+     * the global list because logging every 289 stalls startup.
+     * libesd connect is the same: logging every socket stalls startup,
+     * but the wake-up client's connect path has to be visible. */
+    bool esd_send_cave = pc >= 0x41e9f0b4 && pc < 0x41e9f1e0;
+    bool esd_connect = nr == 283 && env->regs[14] >= 0x41e98000 &&
+                       env->regs[14] < 0x41ea0000;
     uint8_t raw[USER_TRACE_SOCK_BYTES_DEFAULT];
     uint32_t payload_n = 0;
     char extra[512];
@@ -1918,7 +2100,8 @@ void HELPER(user_trace_svc)(CPUARMState *env, uint32_t pc)
 
     extra[0] = 0;
     if (arm_current_el(env) != 0 ||
-        !user_trace_syscall_should_log(nr, ttbr0, asid, env->regs[0])) {
+        (!esd_send_cave && !esd_connect &&
+         !user_trace_syscall_should_log(nr, ttbr0, asid, env->regs[0]))) {
         return;
     }
     retpc = pc + (env->thumb ? 2 : 4);
@@ -2123,9 +2306,11 @@ void HELPER(user_trace_svc)(CPUARMState *env, uint32_t pc)
             uint32_t n = user_trace_copy_guest(cs, io_addr, io_len, write_raw,
                                                sizeof(write_raw));
 
-            if (sock_io ||
+            if (!esd_send_cave && (sock_io ||
                 user_trace_write_interesting(ttbr0, env->regs[0], write_raw,
-                                             n)) {
+                                             n) ||
+                g_strrstr(user_trace_fd_path(ttbr0, env->regs[0]),
+                          "dsptask/pcm1"))) {
                 buf = g_string_new(NULL);
                 user_trace_format_buf(cs, io_addr, io_len, buf);
                 g_strlcpy(extra, buf->str, sizeof(extra));
@@ -2134,6 +2319,13 @@ void HELPER(user_trace_svc)(CPUARMState *env, uint32_t pc)
             payload_n = n > user_trace_sock_bytes() ? user_trace_sock_bytes()
                                                     : n;
             memcpy(raw, write_raw, payload_n);
+        } else {
+            const char *path = user_trace_fd_path(ttbr0, env->regs[0]);
+
+            g_snprintf(extra, sizeof(extra), "fd=%u buflen=%u%s%s",
+                       env->regs[0], io_len,
+                       path[0] ? " path=" : "",
+                       path[0] ? path : "");
         }
     }
     user_trace_svc_arm_enter(pc, retpc, env->regs[14], nr,
@@ -2161,6 +2353,10 @@ void HELPER(user_trace_svc)(CPUARMState *env, uint32_t pc)
         if (nr == 276 && payload_n) {
             user_trace_pending_set_payload(retpc, ttbr0, raw, payload_n);
         }
+    }
+    if (is_read) {
+        user_trace_pending_set_io(retpc, ttbr0, env->regs[0], io_addr, io_len,
+                                  true);
     }
     if ((sock_io || bme) && (is_write || is_read)) {
         user_trace_pending_set_io(retpc, ttbr0, env->regs[0], io_addr, io_len,
@@ -2209,11 +2405,23 @@ void HELPER(user_trace_svc_ret)(CPUARMState *env, uint32_t pc)
             want = user_trace_sock_bytes();
         }
         n = user_trace_copy_guest(cs, addr, want, raw, sizeof(raw));
+        if (addr == 0x41ea0b28u && want >= 4) {
+            fprintf(stderr, "user-trace-cmd2 n=%u bytes=%02x%02x%02x%02x\n",
+                    n, raw[0], raw[1], raw[2], raw[3]);
+        }
         user_trace_pending_set_payload(pc, ttbr0, raw, n);
         buf = g_string_new(NULL);
         user_trace_format_buf(cs, addr, (uint32_t)ret, buf);
         user_trace_set_ret_extra(buf->str);
         g_string_free(buf, TRUE);
+    } else if (pc == 0x410cfdacu && ret == 4) {
+        static unsigned misses;
+
+        if (misses < 6) {
+            fprintf(stderr, "user-trace-cmd2 no-pending pc=%08x ttbr=%08x\n",
+                    pc, (uint32_t)ttbr0);
+            misses++;
+        }
     }
     user_trace_svc_arm_eret(pc, env->regs[0], ttbr0, asid);
     user_trace_maybe_mem(env, "svc-ret", false);

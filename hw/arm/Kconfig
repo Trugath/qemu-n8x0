@@ -171,6 +171,7 @@ config NSERIES
     select TWL92230 # energy-management
     select TUSB6010
     select TLV320AIC33
+    select TCM825X
 
 config OMAP
     bool

@@ -127,7 +127,7 @@ struct n800_s {
 
 /* Addresses on the I2C bus 0 */
 #define N810_TLV320AIC33_ADDR		0x18	/* Audio CODEC */
-#define N8X0_TCM825x_ADDR		0x29	/* Camera */
+#define N8X0_TCM825x_ADDR		0x3d	/* Camera (Diablo i2c client) */
 #define N810_LP5521_ADDR		0x32	/* LEDs */
 #define N810_TSL2563_ADDR		0x3d	/* Light sensor */
 #define N810_LM8323_ADDR		0x45	/* Keyboard */
@@ -163,6 +163,16 @@ static void n8x0_bt_setup(struct n800_s *s)
     qdev_connect_gpio_out(s->mpu->gpio, N8X0_BT_WKUP_GPIO,
                           csr41814_pins_get(radio)[CSR41814_PIN_WAKEUP]);
     omap_uart_attach(s->mpu->uart[BT_UART], radio);
+
+    /*
+     * UART1 is the Bluetooth controller. omap2_uart_init wires the first
+     * -serial backend there, which hides the n810 kernel console once the
+     * radio takes the port. Re-home a lone command-line serial onto UART3
+     * (ttyS2). Four-serial Maemo runs already attach UART3 to serial_hd(2).
+     */
+    if (serial_hd(0) && !serial_hd(2)) {
+        omap_uart_attach(s->mpu->uart[2], serial_hd(0));
+    }
 }
 
 static void n8x0_gpio_setup(struct n800_s *s)
@@ -256,6 +266,16 @@ static void n8x0_i2c_setup(struct n800_s *s, int model)
     qdev_connect_gpio_out(dev, 0, tmp_irq);
 
     /*
+     * Toshiba TCM825x. Diablo's omap24xxcam client is 7-bit 0x3d (not the
+     * 0x29 upstream boards used) and attach_adapter walks every bus.
+     * Register 1 must read back 0. Capture stays unimplemented
+     * (QEMU-OMAP2420-CAM-001).
+     */
+    i2c_slave_create_simple(i2c, "tcm825x", N8X0_TCM825x_ADDR);
+    i2c_slave_create_simple(omap_i2c_bus(s->mpu->i2c[1]), "tcm825x",
+                            N8X0_TCM825x_ADDR);
+
+    /*
      * N810 TLV320AIC33 control is I2C2 @ 0x18 (Linux adapter 2 /
      * tlv320aic3x-codec.2-0018, DTS &i2c2). RESETB is GPIO 118
      * active-low. Digital audio is still DSP-side; this is the
@@ -346,6 +366,8 @@ static void n800_tsc_kbd_setup(struct n800_s *s)
     qemu_add_kbd_event_handler(n800_key_event, s);
 
     tsc210x_set_transform(s->ts.chip, &n800_pointercal);
+    /* N800 playback is EAC → this TSC2301, not a bare EAC speaker. */
+    omap_eac_attach_codec(s->mpu->eac, tsc210x_codec(s->ts.chip));
 }
 
 static void n810_tsc_setup(struct n800_s *s)
@@ -816,7 +838,8 @@ static void n8x0_spi_setup(struct n800_s *s)
     /*
      * CX3110x / STLC4550 on McSPI2 CS0 (OMAP_TAG_WLAN_CX3110X): IRQ GPIO 87,
      * power GPIO 97. Stub answers HOST_ALLOWED / RAM_BOOT READY so SoftMAC
-     * firmware upload can finish; LMAC scan is not modeled yet.
+     * firmware upload can finish. Scan results and the open-AP data path
+     * are answered here; 3826.arm itself is not executed.
      */
     wlan_irq = qdev_get_gpio_in(s->mpu->gpio, N8X0_WLAN_IRQ_GPIO);
     wlan = cx3110x_init(wlan_irq);
@@ -879,7 +902,7 @@ static void n8x0_dss_setup(struct n800_s *s)
     omap_rfbi_attach(s->mpu->dss, 0, &s->blizzard);
 }
 
-static void n8x0_cbus_setup(struct n800_s *s)
+static void n8x0_cbus_setup(struct n800_s *s, int model)
 {
     qemu_irq dat_out = qdev_get_gpio_in(s->mpu->gpio, N8X0_CBUS_DAT_GPIO);
     qemu_irq retu_irq = qdev_get_gpio_in(s->mpu->gpio, N8X0_RETU_GPIO);
@@ -893,6 +916,10 @@ static void n8x0_cbus_setup(struct n800_s *s)
 
     cbus_attach(cbus, s->retu = retu_init(retu_irq, 1));
     cbus_attach(cbus, s->tahvo = tahvo_init(tahvo_irq, 1));
+    if (model == 800) {
+        retu_apply_rx34_idle(s->retu);
+        tahvo_apply_rx34_idle(s->tahvo);
+    }
 }
 
 static void n8x0_usb_setup(struct n800_s *s)
@@ -1250,11 +1277,18 @@ static const struct omap_partition_info_s {
     int mask;
     const char *name;
 } n800_part_info[] = {
+    /*
+     * Diablo initfs_0.95.22 is 2327808 bytes and this tree's OneNAND
+     * image stores it at 0x2a0000 (4 MiB window). The old 2 MiB window
+     * at 0x280000 cut the image off, so /usr/sbin/waitfordsme was
+     * missing and linuxrc entered MALF before BME. Same geometry as
+     * the RX-44 image; masks stay the historical n800 values.
+     */
     { 0x00000000, 0x00020000, 0x3, "bootloader" },
     { 0x00020000, 0x00060000, 0x0, "config" },
-    { 0x00080000, 0x00200000, 0x0, "kernel" },
-    { 0x00280000, 0x00200000, 0x3, "initfs" },
-    { 0x00480000, 0x0fb80000, 0x3, "rootfs" },
+    { 0x00080000, 0x00220000, 0x0, "kernel" },
+    { 0x002a0000, 0x00400000, 0x3, "initfs" },
+    { 0x006a0000, 0x0f960000, 0x3, "rootfs" },
     { /* end of list */ }
 }, n810_part_info[] = {
     { 0x00000000, 0x00020000, 0x3, "bootloader" },
@@ -1292,7 +1326,8 @@ static int n8x0_atag_setup(void *p, int model)
 
     stw_p(w++, OMAP_TAG_LCD);			/* u16 tag */
     stw_p(w++, 36);				/* u16 len */
-    strcpy((void *) w, "QEMU LCD panel");	/* char panel_name[16] */
+    /* RX-34 NOLO tag is ls041y3; the fallback name skips 8x avg / 1 ms. */
+    strcpy((void *) w, model == 800 ? "ls041y3" : "QEMU LCD panel");
     w += 8;
     strcpy((void *) w, "blizzard");		/* char ctrl_name[16] */
     w += 8;
@@ -1514,7 +1549,7 @@ static void n8x0_init(MachineState *machine,
     }
     n8x0_spi_setup(s);
     n8x0_dss_setup(s);
-    n8x0_cbus_setup(s);
+    n8x0_cbus_setup(s, model);
     n8x0_usb_setup(s);
 
     if (machine->kernel_filename) {

@@ -289,7 +289,8 @@ int c55x_l2intc_write16(C55xL2Intc *l2, uint32_t word_addr, uint16_t value)
                    l2->cpu ? (l2->cpu->pc & C55X_PC_MASK) : 0);
             c55x_l2intc_reset(l2);
         }
-        return 0;
+        /* IOMAP aliases this word onto ARM DSP RAM (nolo-tags 0x58009010). */
+        return 1;
     case 0x48: {
         uint32_t control = l2_deposit(0, value, lsw);
 

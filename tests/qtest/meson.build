@@ -214,7 +214,7 @@ qtests_stm32l4x5 = \
    'stm32l4x5_usart-test']
 
 qtests_arm = \
-  (config_all_devices.has_key('CONFIG_NSERIES') ? ['n810-aic33-test'] : []) + \
+  (config_all_devices.has_key('CONFIG_NSERIES') ? ['n810-aic33-test', 'n8x0-eac-audio-test', 'n8x0-dsp-audio-test'] : []) + \
   (config_all_devices.has_key('CONFIG_MPS2') ? ['sse-timer-test'] : []) + \
   (config_all_devices.has_key('CONFIG_CMSDK_APB_DUALTIMER') ? ['cmsdk-apb-dualtimer-test'] : []) + \
   (config_all_devices.has_key('CONFIG_CMSDK_APB_TIMER') ? ['cmsdk-apb-timer-test'] : []) + \

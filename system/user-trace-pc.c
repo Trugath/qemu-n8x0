@@ -18,6 +18,12 @@
 #include "exec/cpu-common.h"
 #include "sysemu/runstate.h"
 
+void omap2420_dsp_pcm1_read_entered(uint32_t nbytes);
+void omap2420_dsp_pcm1_read_result(uint32_t nbytes, uint32_t got,
+                                   const uint8_t *buf, uint32_t n);
+void omap2420_dsp_pcm1_read_finished(void);
+void omap2420_dsp_pcm1_n2_finished(void);
+
 #define LINUX_O_NONBLOCK 0x800
 #define USER_TRACE_NOSMQ_MAX 256
 #define USER_TRACE_NOSMQ_MSG 16
@@ -137,6 +143,7 @@ static const UserTraceSyscall user_trace_syscall_table[] = {
     { "open", 5 },
     { "close", 6 },
     { "execve", 11 },
+    { "lseek", 19 },
     { "getpid", 20 },
     { "getppid", 64 },
     { "pause", 29 },
@@ -148,6 +155,7 @@ static const UserTraceSyscall user_trace_syscall_table[] = {
     { "dup2", 63 },
     { "sigsuspend", 72 },
     { "wait4", 114 },
+    { "_llseek", 140 },
     { "mmap", 90 },
     { "munmap", 91 },
     { "sigreturn", 119 },
@@ -163,6 +171,7 @@ static const UserTraceSyscall user_trace_syscall_table[] = {
     { "rt_sigtimedwait", 177 },
     { "rt_sigqueueinfo", 178 },
     { "rt_sigsuspend", 179 },
+    { "pread64", 180 },
     { "vfork", 190 },
     { "mmap2", 192 },
     { "gettid", 224 },
@@ -948,6 +957,38 @@ static UserTraceFd *trace_fd_find(uint64_t ttbr0, uint32_t fd)
     return NULL;
 }
 
+static bool path_is_pcm1(const char *path)
+{
+    return path && path[0] && g_strrstr(path, "dsptask/pcm1");
+}
+
+static bool pcm1_fd_match(uint64_t ttbr0, uint32_t fd)
+{
+    const UserTraceFd *slot = trace_fd_find(ttbr0, fd);
+
+    return slot && path_is_pcm1(slot->path);
+}
+
+static bool pcm1_opened_on_as(uint64_t ttbr0)
+{
+    int i;
+
+    for (i = 0; i < USER_TRACE_FD_MAX; i++) {
+        if (user_trace_fds[i].used && user_trace_fds[i].ttbr0 == ttbr0 &&
+            path_is_pcm1(user_trace_fds[i].path)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+const char *user_trace_fd_path(uint64_t ttbr0, uint32_t fd)
+{
+    const UserTraceFd *slot = trace_fd_find(ttbr0, fd);
+
+    return slot && slot->path[0] ? slot->path : "";
+}
+
 static void trace_fd_log(const char *why, const UserTraceFd *slot)
 {
     const UserTraceProc *proc;
@@ -1359,20 +1400,40 @@ static bool svc_verbose(uint32_t nr)
                          user_trace_window_end);
 }
 
+/*
+ * target/arm supplies a strong definition. The debug walker misses some
+ * pages the short-descriptor fallback can still read.
+ */
+uint32_t __attribute__((weak))
+user_trace_arch_copy(uint32_t addr, void *buf, uint32_t len)
+{
+    (void)addr;
+    (void)buf;
+    (void)len;
+    return 0;
+}
+
 static uint32_t guest_copy(uint32_t addr, void *buf, uint32_t len)
 {
     uint8_t *out = buf;
     uint32_t i;
+    uint32_t n;
 
-    if (!first_cpu || !addr || !len) {
+    CPUState *cs = current_cpu ? current_cpu : first_cpu;
+
+    if (!cs || !addr || !len) {
         return 0;
     }
     for (i = 0; i < len; i++) {
-        if (cpu_memory_rw_debug(first_cpu, addr + i, &out[i], 1, false) != 0) {
-            return i;
+        if (cpu_memory_rw_debug(cs, addr + i, &out[i], 1, false) != 0) {
+            break;
         }
     }
-    return len;
+    if (i == len) {
+        return len;
+    }
+    n = user_trace_arch_copy(addr + i, out + i, len - i);
+    return i + n;
 }
 
 static void fill_poll_mask(GString *buf, uint16_t mask)
@@ -1535,11 +1596,24 @@ static void fill_eret_extra(UserTracePending *pending, uint32_t r0)
             want = user_trace_sock_byte_count;
         }
         n = guest_copy(pending->buf_addr, raw, want);
-        if (n > sizeof(pending->payload)) {
-            n = sizeof(pending->payload);
+        /*
+         * The SVC-return helper already copied this buffer with the
+         * live CPU. first_cpu's debug walk can miss that page and
+         * would otherwise replace a real payload with cap=0.
+         */
+        if (n == 0 && pending->payload_len > 0) {
+            n = pending->payload_len;
+            if (n > sizeof(raw)) {
+                n = sizeof(raw);
+            }
+            memcpy(raw, pending->payload, n);
+        } else {
+            if (n > sizeof(pending->payload)) {
+                n = sizeof(pending->payload);
+            }
+            memcpy(pending->payload, raw, n);
+            pending->payload_len = n;
         }
-        memcpy(pending->payload, raw, n);
-        pending->payload_len = n;
         buf = g_string_new(NULL);
         g_string_append_printf(buf, "buflen=%u cap=%u hex=", (uint32_t)ret, n);
         for (i = 0; i < n; i++) {
@@ -1826,26 +1900,29 @@ static void sock_register(uint64_t ttbr0, uint32_t fd, const char *path,
     sock_log(role, slot, 0);
 }
 
+/* Low attribute bits differ across a syscall; the L1 base does not. */
+static bool pending_ttbr_match(uint64_t pending_ttbr, uint64_t live_ttbr)
+{
+    return ((uint32_t)pending_ttbr & 0xffffc000u) ==
+           ((uint32_t)live_ttbr & 0xffffc000u);
+}
+
 static UserTracePending *pending_find(uint32_t retpc, uint64_t ttbr0)
 {
     int i;
     UserTracePending *best = NULL;
-    UserTracePending *any = NULL;
 
     for (i = 0; i < USER_TRACE_PENDING_MAX; i++) {
         if (!user_trace_pending[i].used ||
-            user_trace_pending[i].retpc != retpc) {
+            user_trace_pending[i].retpc != retpc ||
+            !pending_ttbr_match(user_trace_pending[i].ttbr0, ttbr0)) {
             continue;
         }
-        if (user_trace_pending[i].ttbr0 == ttbr0) {
-            if (!best || user_trace_pending[i].enter_ns >= best->enter_ns) {
-                best = &user_trace_pending[i];
-            }
-        } else if (!any || user_trace_pending[i].enter_ns >= any->enter_ns) {
-            any = &user_trace_pending[i];
+        if (!best || user_trace_pending[i].enter_ns >= best->enter_ns) {
+            best = &user_trace_pending[i];
         }
     }
-    return best ? best : any;
+    return best;
 }
 
 static void retpc_remember(uint32_t retpc)
@@ -1975,22 +2052,18 @@ static UserTracePending *pending_take(uint32_t pc, uint64_t ttbr0)
 {
     int i;
     UserTracePending *best = NULL;
-    UserTracePending *any = NULL;
 
     for (i = 0; i < USER_TRACE_PENDING_MAX; i++) {
         if (!user_trace_pending[i].used ||
-            user_trace_pending[i].retpc != pc) {
+            user_trace_pending[i].retpc != pc ||
+            !pending_ttbr_match(user_trace_pending[i].ttbr0, ttbr0)) {
             continue;
         }
-        if (user_trace_pending[i].ttbr0 == ttbr0) {
-            if (!best || user_trace_pending[i].enter_ns >= best->enter_ns) {
-                best = &user_trace_pending[i];
-            }
-        } else if (!any || user_trace_pending[i].enter_ns >= any->enter_ns) {
-            any = &user_trace_pending[i];
+        if (!best || user_trace_pending[i].enter_ns >= best->enter_ns) {
+            best = &user_trace_pending[i];
         }
     }
-    return best ? best : any;
+    return best;
 }
 
 static void decode_signal(uint32_t nr, const uint32_t *r,
@@ -2250,6 +2323,13 @@ bool user_trace_pc_enabled(void)
 
 bool user_trace_pc_match(uint64_t pc)
 {
+    /*
+     * esd_send_file's write. r1 is the file PCM and r2 its length,
+     * before the daemon mixes the stream.
+     */
+    if (pc == 0x41e9c85cu && user_trace_syscall_enabled()) {
+        return true;
+    }
     return list_match(user_trace_pcs, user_trace_pc_count, pc);
 }
 
@@ -2562,6 +2642,19 @@ bool user_trace_syscall_should_log(uint32_t nr, uint64_t ttbr0, uint32_t asid,
         !sock_io && !sock_wait) {
         return false;
     }
+    /*
+     * Global read floods delay esd past startup. Even with
+     * -user-trace-syscall-global, log read/readv only on the pcm1 fd
+     * or the AS that opened pcm1. That AS must stay traced after the
+     * 8–40 s window: mmap/cmd2 often land near quit-sec 45, and esd
+     * may still be unnamed right after execve.
+     */
+    if (listed && pcm1_opened_on_as(ttbr0)) {
+        return true;
+    }
+    if (listed && is_read_nr(nr) && !sock_io) {
+        return pcm1_fd_match(ttbr0, r0);
+    }
     if (!user_trace_syscall_global && user_trace_learn_pc_count > 0 &&
         !bme && !lifetime && !fd_life && !sock_setup && !sock_io &&
         !sock_wait) {
@@ -2864,6 +2957,9 @@ void user_trace_svc_arm_enter(uint32_t pc, uint32_t retpc, uint32_t lr,
         user_trace_bme_syscall_enter(ttbr0);
     }
     user_trace_quit_ensure();
+    if (nr == 3 && extra && strstr(extra, "dsptask/pcm1")) {
+        omap2420_dsp_pcm1_read_entered(r2);
+    }
     if (svc_verbose(nr)) {
         qemu_log("user-trace-svc ns=%" PRId64 " nr=%u name=%s pc=0x%" PRIx32
                  " lr=0x%" PRIx32 " retpc=0x%" PRIx32 " ttbr0=0x%" PRIx64
@@ -2918,6 +3014,24 @@ void user_trace_svc_arm_eret(uint32_t pc, uint32_t r0, uint64_t ttbr0,
         return;
     }
     fill_eret_extra(pending, r0);
+    if (pending->nr == 3 && pcm1_fd_match(ttbr0, pending->r[0]) &&
+        pending->r[2] == 2) {
+        omap2420_dsp_pcm1_n2_finished();
+    }
+    if (pending->nr == 3 && pcm1_fd_match(ttbr0, pending->r[0]) &&
+        (pending->r[2] == 4 || pending->r[2] == 10 || pending->r[2] == 40)) {
+        uint8_t bytes[16];
+        uint32_t n = pending->r[2] < sizeof(bytes) ? pending->r[2] : sizeof(bytes);
+
+        if ((int32_t)r0 > 0) {
+            n = guest_copy(pending->r[1], bytes, n < (uint32_t)r0 ? n :
+                           (uint32_t)r0);
+        } else {
+            n = 0;
+        }
+        omap2420_dsp_pcm1_read_result(pending->r[2], r0, bytes, n);
+        omap2420_dsp_pcm1_read_finished();
+    }
     finish_svc(pending, r0);
     user_trace_bme_syscall_leave(ttbr0);
     pending->used = false;

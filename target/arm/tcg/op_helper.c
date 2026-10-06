@@ -27,6 +27,7 @@
 #include "cpregs.h"
 #ifndef CONFIG_USER_ONLY
 #include "qemu/user-trace-pc.h"
+#include "hw/arm/omap.h"
 #endif
 
 #define SIGNBIT (uint32_t)0x80000000
@@ -387,6 +388,13 @@ void HELPER(wfi)(CPUARMState *env, uint32_t insn_len)
 #else
     CPUState *cs = env_cpu(env);
     int target_el = check_wfx_trap(env, false);
+
+    /*
+     * esd's pcm1 read sleeps here after FIFO1 NEWMSG rose while
+     * NEWIRQAGR was still clear. Re-arm only that latched mailbox line.
+     */
+    omap2420_dsp_on_wfi();
+    omap2_intc_rearm_halted_mail();
 
     if (cpu_has_work(cs)) {
         /* Don't bother to go into our "low power state" if

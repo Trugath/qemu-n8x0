@@ -81,7 +81,14 @@ static int next_declares_pair(const uint8_t *b, unsigned avail, unsigned len0)
         return 0;
     }
     next_lead = c55x_lead_size[next];
-    if (next_lead < 2 || len0 + next_lead > 6 || len0 + next_lead > avail) {
+    /*
+     * The instruction buffer is 8 bytes. A 6-byte cap split
+     * `76ffffa8 || 170059` (MOV #-1,AR2 || MOV #5,BRC0, 7 bytes) and
+     * shifted every later pair in _EAP_CC_RequestStream, so RPTB's REA
+     * sat inside the loop's increment and the free-slot scan ran once.
+     */
+    if (next_lead < 2 || len0 + next_lead > C55X_FETCH_MAX ||
+        len0 + next_lead > avail) {
         return 0;
     }
     return 1;
@@ -225,12 +232,12 @@ static int parse_smem(uint8_t field, const uint8_t *ext, C55xSmem *sm)
         break;
     case 0x09:
         /*
-         * PPP0 1001 mnemonic *(ARn-T0).  Stock mumdrc (ARMS=0) needs this
-         * indexed — post-modify walked AR2 from the SP scratch base onto
-         * the saved T2 slot (T2SLOT-WR @ 134d8c/134dc9).  Matches Xmem
-         * MMM=101 INDEX_MINUS_T0.
+         * Smem PPP0 1001. Silicon t0min: the load uses ARn, then ARn
+         * is post-modified by -AR0 when C54CM=1 (AR0=4 T0=2 left AR4
+         * at 0x1fc; BK03=5 wrapped 0-4 to 1). C54CM=0 uses T0.
+         * Xmem MMM=101 is the same post-modify (dspfin xm_a4/xm_a2).
          */
-        sm->mod = C55X_MOD_INDEX_MINUS_T0;
+        sm->mod = C55X_MOD_MINUS_T0;
         break;
     case 0x0b:
         sm->mod = C55X_MOD_INDEX_T0;
@@ -319,10 +326,12 @@ static int parse_xmem(unsigned ar, unsigned mmm, C55xSmem *sm)
      * SPRU374 Xmem/Ymem MMM (3-bit), not Smem:
      *  000 *ARn  001 *ARn+  010 *ARn-
      *  011 *(ARn+T0)  100 *(ARn+T1)  — indexed, ARn unchanged
-     *  101 *(ARn-T0)  110 *(ARn-T1)  — indexed, ARn unchanged
+     *  101 *(ARn-T0) — post-modify. dspfin: T0=0, AR0=4 left AR4
+     *  at 0x1fc and AR0=2 left AR4 at 0x1fe, AC0=0x1234.
+     *  110 *(ARn-T1) — indexed, ARn unchanged
      *  111 *ARn(T0)
      * Smem post-modify *ARn±T0/T1 uses a different field encoding in
-     * parse_smem; do not map those here.
+     * parse_smem. MMM=110 stays indexed until it has a silicon row.
      */
     switch (mmm & 7) {
     case 0:
@@ -341,7 +350,7 @@ static int parse_xmem(unsigned ar, unsigned mmm, C55xSmem *sm)
         sm->mod = C55X_MOD_INDEX_T1;
         break;
     case 5:
-        sm->mod = C55X_MOD_INDEX_MINUS_T0;
+        sm->mod = C55X_MOD_MINUS_T0;
         break;
     case 6:
         sm->mod = C55X_MOD_INDEX_MINUS_T1;
@@ -1575,6 +1584,19 @@ static int decode_one(const uint8_t *b, unsigned avail, C55xOp *op,
         }
         if (xy == 0x04) {
             op->kind = C55X_OP_MOV_XMEM_YMEM;
+            /*
+             * Single MOV Xmem, Ymem uses *(ARn+T1) as a post-modify
+             * by T1. The pcm deinterleave (12582e 80b214, T1=2, AR
+             * pair one word apart) walks both channels. Indexed
+             * *(ARn+T1) repeats one sample into the whole half.
+             * MOV dbl keeps MMM=100 indexed (mumdrc 80 06 c0).
+             */
+            if (op->smem.mod == C55X_MOD_INDEX_T1) {
+                op->smem.mod = C55X_MOD_PLUS_T1;
+            }
+            if (op->ymem.mod == C55X_MOD_INDEX_T1) {
+                op->ymem.mod = C55X_MOD_PLUS_T1;
+            }
         } else if (xy == 0x00) {
             op->kind = C55X_OP_MOV_DBL_XY;
         } else if (xy == 0x08) {
@@ -2323,6 +2345,16 @@ static int decode_one(const uint8_t *b, unsigned avail, C55xOp *op,
         return 0;
     }
     if (op0 == 0xe7 || op0 == 0xe8) {
+        /*
+         * SPRU374 Table 5-1:
+         *   e7 SSss00xx  MOV ACx << Tx, Smem
+         *   e7 SSss10x%  MOV [rnd(]HI(ACx << Tx)[)], Smem
+         *   e7 SSss11u%  MOV [uns(] [rnd(]HI(saturate(ACx << Tx))[))], Smem
+         *   e8 SSxxx0x%  MOV [rnd(]HI(ACx)[)], Smem
+         *   e8 SSxxx1u%  MOV [uns(] [rnd(]HI(saturate(ACx))[))], Smem
+         * cond 2: exec shifts by T[ss], not an immediate. Bits 3:2 == 01
+         * is not an opcode. e87104 is MOV HI(saturate(AC0)),*CDP.
+         */
         need = 3 + ext;
         if (avail < need) {
             return -1;
@@ -2331,8 +2363,29 @@ static int decode_one(const uint8_t *b, unsigned avail, C55xOp *op,
         op->kind = C55X_OP_MOV_HI_AC_SHFT_SMEM;
         op->smem = smem;
         op->src = extra >> 6;
-        op->shft = extra & 0x3f;
-        op->st = (op0 == 0xe7) ? 1 : 2;
+        op->shft = 0;
+        if (op0 == 0xe7) {
+            unsigned form = (extra >> 2) & 3;
+
+            op->cond = 2;
+            op->shft = (extra >> 4) & 3;
+            if (form == 0) {
+                op->kind = C55X_OP_MOV_AC_SHFT_SMEM;
+            } else if (form == 2) {
+                op->bit = 0;
+                op->st = (extra & 1) ? 1 : 0;
+            } else if (form == 3) {
+                op->bit = (extra >> 1) & 1;
+                op->st = 2 | ((extra & 1) ? 1 : 0);
+            } else {
+                return -1;
+            }
+        } else if (extra & 0x04) {
+            op->bit = (extra >> 1) & 1;
+            op->st = 2 | ((extra & 1) ? 1 : 0);
+        } else {
+            op->st = (extra & 1) ? 1 : 0;
+        }
         *len_out = need;
         return 0;
     }
@@ -2859,6 +2912,60 @@ static int decode_8b_sh16_xar_dbl(const uint8_t *b, unsigned avail,
 }
 
 /*
+ * TI dis55: 5-byte 0x8b is MOV HI(ACx), Smem || A-unit when byte2's
+ * low nibble is 0xC|SS (HI(AC0..AC3)). Do not reuse the 0x8a
+ * MOV Smem, dst pack — that turns the SRC output store into a load.
+ * Stock 8b534c1270 at _SRC_TII_asmDoubleStageConvert 0x136192 is
+ * MOV HI(AC0),*AR2(short(#1)) || ASUB T3,T0.
+ */
+static int decode_8b_hi_smem_aunit(const uint8_t *b, unsigned avail,
+                                   C55xDecodedInsn *out)
+{
+    C55xSmem smem;
+
+    if (avail < 5 || (b[2] & 0x0c) != 0x0c || !aunit_aop_ok(b[3]) ||
+        smem_ext_len(b[1]) || parse_smem(b[1], b + 5, &smem)) {
+        return -1;
+    }
+    out->op[0].kind = C55X_OP_MOV_HI_SMEM;
+    out->op[0].smem = smem;
+    out->op[0].src = b[2] & 3;
+    if (decode_aunit_aop(b[3], b[4], b[2] >> 4, &out->op[1])) {
+        return -1;
+    }
+    out->op_count = 2;
+    out->length = 5;
+    return 0;
+}
+
+/*
+ * TI dis55: 8b91541c01 / 8b91641940 are
+ *   AMAR *CDP+ || AADD #1,T1
+ *   AMAR *CDP+ || AMOV T0,T2
+ * Byte1 is Smem (*CDP+ = 0x91). Byte2 low nibble 0x4 selects AMAR
+ * (0xC in that nibble is the MOV HI form). Byte2 high nibble is the
+ * A-unit destination.
+ */
+static int decode_8b_amar_aunit(const uint8_t *b, unsigned avail,
+                                C55xDecodedInsn *out)
+{
+    C55xSmem smem;
+
+    if (avail < 5 || (b[2] & 0x0f) != 0x04 || !aunit_aop_ok(b[3]) ||
+        smem_ext_len(b[1]) || parse_smem(b[1], b + 5, &smem)) {
+        return -1;
+    }
+    out->op[0].kind = C55X_OP_AMAR_SMEM;
+    out->op[0].smem = smem;
+    if (decode_aunit_aop(b[3], b[4], b[2] >> 4, &out->op[1])) {
+        return -1;
+    }
+    out->op_count = 2;
+    out->length = 5;
+    return 0;
+}
+
+/*
  * TI dis55 v4.2.3: 0x8a is MOV Smem, dst || A-unit (5 bytes).
  *   8a Smem (Adest:4 Mdest:4) Aop last
  * Stock 8a00ba18a1 at 0x126443 is
@@ -3316,10 +3423,16 @@ int c55x_decode(C55xCPU *cpu, uint32_t pc, C55xDecodedInsn *out)
         return -1;
     }
     if (b[0] == 0x8a || b[0] == 0x8b) {
-        if ((b[0] == 0x8b &&
-             decode_8b_sh16_xar_dbl(b, C55X_FETCH_MAX, out) == 0) ||
-            decode_8a_pair(b, C55X_FETCH_MAX, out) == 0 ||
-            decode_8a_dual(b, C55X_FETCH_MAX, out) == 0) {
+        if (b[0] == 0x8b &&
+            (decode_8b_sh16_xar_dbl(b, C55X_FETCH_MAX, out) == 0 ||
+             decode_8b_hi_smem_aunit(b, C55X_FETCH_MAX, out) == 0 ||
+             decode_8b_amar_aunit(b, C55X_FETCH_MAX, out) == 0)) {
+            set_raw(out, b, out->length);
+            return 0;
+        }
+        if (b[0] == 0x8a &&
+            (decode_8a_pair(b, C55X_FETCH_MAX, out) == 0 ||
+             decode_8a_dual(b, C55X_FETCH_MAX, out) == 0)) {
             set_raw(out, b, out->length);
             return 0;
         }
@@ -3855,6 +3968,9 @@ void c55x_disasm(const C55xDecodedInsn *in, char *buf, size_t len)
     case C55X_OP_IVEC:
         snprintf(buf, len, ".ivec #%#x, %s%s", op->target,
                  op->bit ? "C54X_STK" : "USE_RETA", q);
+        break;
+    case C55X_OP_MOV_HI_SMEM:
+        snprintf(buf, len, "MOV HI(AC%u), %s%s", op->src & 3, sm, q);
         break;
     case C55X_OP_MOV_HI_AC_SHFT_SMEM:
         snprintf(buf, len, "MOV HI(AC%u << #%u), %s%s",

@@ -90,7 +90,16 @@ static void tcg_cpu_reset_hold(CPUState *cpu)
 /* mask must never be zero, except for A20 change call */
 void tcg_handle_interrupt(CPUState *cpu, int mask)
 {
-    g_assert(bql_locked());
+    bool held = bql_locked();
+
+    /*
+     * The DSP worker drops the BQL between quanta. An EAC or mailbox
+     * IRQ from the audio thread lands in that window and used to abort
+     * the boot before the greeting. Take the lock for the request.
+     */
+    if (!held) {
+        bql_lock();
+    }
 
     cpu->interrupt_request |= mask;
 
@@ -102,6 +111,9 @@ void tcg_handle_interrupt(CPUState *cpu, int mask)
         qemu_cpu_kick(cpu);
     } else {
         qatomic_set(&cpu->neg.icount_decr.u16.high, -1);
+    }
+    if (!held) {
+        bql_unlock();
     }
 }
 

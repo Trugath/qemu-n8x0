@@ -234,7 +234,12 @@ void c55x_reset(C55xCPU *cpu)
     cpu->xdp = 0;
     cpu->xcdp = 0;
     cpu->st0 = C55X_ST0_CARRY;
-    cpu->st1 = C55X_ST1_INTM;
+    /*
+     * SPRU371: SXMD resets to 1. RX-34 confirmed it on a stub that
+     * never writes ST1: MOV port(0x304f), AC0 of 0xec18 published
+     * 0xffffec18.
+     */
+    cpu->st1 = C55X_ST1_INTM | C55X_ST1_SXMD;
     cpu->st2 = C55X_ST2_DBGM;
     cpu->st3 = 0;
     cpu->ier0 = 0;
@@ -431,11 +436,7 @@ void c55x_set_reg(C55xCPU *cpu, unsigned fsss, uint64_t value)
 {
     fsss &= 15;
     if (fsss < 4) {
-        /* M40=0: keep GU clear (32-bit AC image; silicon mailbox is 32-bit). */
-        if (!(cpu->st1 & (C55X_ST1_M40 | C55X_ST1_C54CM))) {
-            value &= 0xffffffffull;
-        }
-        cpu->ac[fsss] = value & C55X_AC_MASK;
+        cpu->ac[fsss] = c55x_ac_store(cpu, value);
         return;
     }
     if (fsss < 8) {
@@ -921,10 +922,14 @@ static const char *c55x_pc_transition(const C55xCPU *cpu, uint32_t pc)
 static uint16_t dump_read16(const C55xCPU *cpu, uint32_t word)
 {
     uint16_t v = 0;
+    C55xCPU *rw = (C55xCPU *)cpu;
 
+    /* Same as peek16: a trace read must not replace FAULT_AD. */
+    rw->diag_read = 1;
     if (cpu->bus.read16) {
         cpu->bus.read16(cpu->bus.opaque, word, &v);
     }
+    rw->diag_read = 0;
     return v;
 }
 
@@ -961,9 +966,16 @@ void c55x_dump(const C55xCPU *cpu, const C55xDecodedInsn *in,
     around[0] = '\0';
     win_at = (pc >= 16u) ? (pc - 16u) : 0;
     win_n = 0;
+    /*
+     * The disassembly window can start below a mapped page
+     * (IOMAP at 0xfc0000, PC 0xfc0006). That fetch is not the
+     * program's memory operand.
+     */
+    ((C55xCPU *)cpu)->diag_read = 1;
     if (c55x_fetch((C55xCPU *)cpu, win_at, win, sizeof(win)) == 0) {
         win_n = sizeof(win);
     }
+    ((C55xCPU *)cpu)->diag_read = 0;
     n = 0;
     for (i = 0; i < win_n && n + 3 < sizeof(around); i++) {
         n += (unsigned)snprintf(around + n, sizeof(around) - n, "%s%02x",

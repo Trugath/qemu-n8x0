@@ -556,6 +556,7 @@ typedef struct C55xCPU {
     uint16_t pkt_csr;
     uint8_t pkt_src_valid;
     uint8_t mem_init_logged;
+    uint8_t diag_read;
     uint32_t pkt_wr_word[8];
     uint16_t pkt_wr_value[8];
     uint8_t pkt_wr_n;
@@ -616,6 +617,7 @@ typedef struct C55xCPU {
     uint32_t last_reti_to;
     uint32_t audio_isr_n;
     uint8_t in_audio_isr;
+    uint8_t pcm1_cmd4_ready;
     uint8_t snap_1012fb;
     uint32_t host_tc_n;
     uint32_t host_clnk_n;
@@ -652,6 +654,28 @@ static inline uint32_t c55x_xar(const C55xCPU *cpu, unsigned n)
 static inline uint16_t c55x_ar(const C55xCPU *cpu, unsigned n)
 {
     return (uint16_t)cpu->xar[n & 7];
+}
+
+/*
+ * M40=0: D-unit arithmetic is 32-bit (SPRU371F). Keep GU as the sign
+ * extension of bit 31 rather than clearing it, so SXMD / NOT / SUB still
+ * produce a 40-bit image.
+ */
+static inline uint64_t c55x_ac_store(const C55xCPU *cpu, uint64_t value)
+{
+    value &= C55X_AC_MASK;
+    if (cpu->st1 & (C55X_ST1_M40 | C55X_ST1_C54CM)) {
+        return value;
+    }
+    if (cpu->st1 & C55X_ST1_SXMD) {
+        if (value & (1ull << 31)) {
+            value |= 0xff00000000ull;
+        } else {
+            value &= 0xffffffffull;
+        }
+        return value;
+    }
+    return value & 0xffffffffull;
 }
 
 void c55x_init(C55xCPU *cpu, const C55xBus *bus);

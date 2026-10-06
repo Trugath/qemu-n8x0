@@ -37,6 +37,19 @@ typedef struct {
 
     int32_t x, y;
     bool pressure;
+    /*
+     * Pressure latched when a conversion is armed. Z is computed at
+     * read time; once the host button is up, Z2_TRANSFORM exceeds 4000
+     * and the Maemo driver throws the sample away (z2 > 4000).
+     */
+    bool conv_pressure;
+    /*
+     * The guest collects four DAV samples before it reports BTN_TOUCH,
+     * then a quiet gap so its pen-up timer releases the button. A host
+     * click is shorter than that, so keep scanning this many samples
+     * after the button goes up.
+     */
+    int samples_needed;
 
     uint8_t reg, state;
     bool irq, command;
@@ -105,9 +118,9 @@ static const uint16_t mode_regs[16] = {
 #define Y_TRANSFORM(s)      \
     ((s->y * s->tr[4] - s->x * s->tr[5]) / s->tr[6] + s->tr[7])
 #define Z1_TRANSFORM(s)     \
-    ((400 - ((s)->x >> 7) + ((s)->pressure << 10)) << 4)
+    ((400 - ((s)->x >> 7) + ((s)->conv_pressure << 10)) << 4)
 #define Z2_TRANSFORM(s)     \
-    ((4000 + ((s)->y >> 7) - ((s)->pressure << 10)) << 4)
+    ((4000 + ((s)->y >> 7) - ((s)->conv_pressure << 10)) << 4)
 
 #define AUX_VAL       (700 << 4)  /* +/- 3 at 12-bit */
 #define TEMP1_VAL     (1264 << 4) /* +/- 5 at 12-bit */
@@ -133,6 +146,9 @@ static uint16_t tsc2005_read(TSC2005State *s, int reg)
                 (s->noise & 3);
     case 0x3: /* Z2 */
         s->dav &= 0xefff;
+        if (s->samples_needed > 0) {
+            s->samples_needed--;
+        }
         return TSC_CUT_RESOLUTION(Z2_TRANSFORM(s), s->precision) |
                 (s->noise & 3);
 
@@ -232,6 +248,12 @@ static void tsc2005_write(TSC2005State *s, int reg, uint16_t data)
     }
 }
 
+/* Pen is still down, or a short tap still owes the guest samples. */
+static bool tsc2005_touched(TSC2005State *s)
+{
+    return s->pressure || s->samples_needed > 0;
+}
+
 /* This handles most of the chip's logic.  */
 static void tsc2005_pin_update(TSC2005State *s)
 {
@@ -263,7 +285,7 @@ static void tsc2005_pin_update(TSC2005State *s)
         if (!s->host_mode && s->dav) {
             s->enabled = false;
         }
-        if (!s->pressure) {
+        if (!tsc2005_touched(s)) {
             return;
         }
         /* Fall through */
@@ -273,7 +295,7 @@ static void tsc2005_pin_update(TSC2005State *s)
     case TSC_MODE_X:
     case TSC_MODE_Y:
     case TSC_MODE_Z:
-        if (!s->pressure) {
+        if (!tsc2005_touched(s)) {
             return;
         }
         /* Fall through */
@@ -304,8 +326,11 @@ static void tsc2005_pin_update(TSC2005State *s)
     s->precision = s->nextprecision;
     s->function = s->nextfunction;
     s->pdst = !s->pnd0; /* Synchronised on internal clock */
+    /* Finger is down now, or this is one of the owed post-tap samples. */
+    s->conv_pressure = true;
+    /* ~2ms. Four samples have to land before the guest pen-up timer. */
     expires = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-        (NANOSECONDS_PER_SECOND >> 7);
+        (NANOSECONDS_PER_SECOND >> 9);
     timer_mod(s->timer, expires);
 }
 
@@ -313,6 +338,8 @@ static void tsc2005_reset(TSC2005State *s)
 {
     s->state = 0;
     s->pin_func = 0;
+    s->conv_pressure = false;
+    s->samples_needed = 0;
     s->enabled = false;
     s->busy = false;
     s->nextprecision = false;
@@ -437,6 +464,15 @@ static void tsc2005_timer_tick(void *opaque)
         TSC_CUT_RESOLUTION(Y_TRANSFORM(s), s->precision),
         TSC_CUT_RESOLUTION(Z1_TRANSFORM(s), s->precision),
         TSC_CUT_RESOLUTION(Z2_TRANSFORM(s), s->precision), s->pressure);
+    /*
+     * Maemo requests the DAV GPIO as a falling edge. If data was already
+     * waiting, the line is already low and the new sample is invisible.
+     * Lift it first so pin_update's drop is a real edge.
+     */
+    if ((s->pin_func == 1 || s->pin_func == 3) && !s->irq) {
+        s->irq = true;
+        qemu_set_irq(s->pint, 1);
+    }
     tsc2005_pin_update(s);
 }
 
@@ -449,6 +485,9 @@ static void tsc2005_touchscreen_event(void *opaque,
     if (buttons_state) {
         s->x = x;
         s->y = y;
+        if (!p) {
+            s->samples_needed = 4;
+        }
     }
     s->pressure = !!buttons_state;
     trace_tsc2005_pen(s->x, s->y, s->pressure);

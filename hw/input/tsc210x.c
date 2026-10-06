@@ -1,6 +1,6 @@
 /*
  * TI TSC2102 (touchscreen/sensors/audio controller) emulator.
- * TI TSC2301 (touchscreen/sensors/keypad).
+ * TI TSC2301 (touchscreen, keypad, and audio codec).
  *
  * Copyright (c) 2006 Andrzej Zaborowski  <balrog@zabor.org>
  * Copyright (C) 2008 Nokia Corporation
@@ -78,10 +78,14 @@ typedef struct {
     uint16_t audio_ctrl3;
     uint16_t pll[3];
     uint16_t volume;
+    uint16_t adc_volume;     /* page 2 reg 01h */
+    uint16_t bypass_volume;  /* page 2 reg 03h */
     int64_t volume_change;
     bool softstep;
     uint16_t dac_power;
     int64_t powerdown;
+    int64_t dac_ready_at;
+    QEMUTimer *dac_ready_timer;
     uint16_t filter_data[0x14];
 
     const char *name;
@@ -159,6 +163,8 @@ static const uint16_t mode_regs[16] = {
 
 #define TSC_POWEROFF_DELAY		50
 #define TSC_SOFTSTEP_DELAY		50
+/* RX-34 still reports PDSTS=0 100 ms after DAPD clears. */
+#define TSC_PDSTS_NS			(200 * NANOSECONDS_PER_SECOND / 1000)
 
 static void tsc210x_reset(TSC210xState *s)
 {
@@ -172,17 +178,25 @@ static void tsc210x_reset(TSC210xState *s)
     s->irq = false;
     s->dav = 0;
 
-    s->audio_ctrl1 = 0x0000;
+    /* SLAS371D defaults. HPF[1:0]=11, ADC/DAC/bypass muted at 0 dB. */
+    s->audio_ctrl1 = 0xc000;
     s->audio_ctrl2 = 0x4410;
     s->audio_ctrl3 = 0x0000;
     s->pll[0] = 0x1004;
     s->pll[1] = 0x0000;
     s->pll[2] = 0x1fff;
     s->volume = 0xffff;
-    s->dac_power = 0x8540;
+    s->adc_volume = 0xd7d7;
+    s->bypass_volume = 0xe7e7;
+    /* Power-down bits 15:8 and MIBPD, without read-only PDSTS/OTSYN. */
+    s->dac_power = 0xff40;
     s->softstep = true;
     s->volume_change = 0;
     s->powerdown = 0;
+    s->dac_ready_at = 0;
+    if (s->dac_ready_timer) {
+        timer_del(s->dac_ready_timer);
+    }
     s->filter_data[0x00] = 0x6be3;
     s->filter_data[0x01] = 0x9666;
     s->filter_data[0x02] = 0x675d;
@@ -298,13 +312,56 @@ static void tsc2102_audio_rate_update(TSC210xState *s)
     }
 
     s->codec.tx_rate = rate->rate;
+    /*
+     * DACFS 0 is the 48000 table row, but only a legal Audio Control 1
+     * value selects it. Reset is 0xc000 and the guest write sets bits
+     * the codec rejects, leaving DACFS at 0. The startup file is
+     * 11025 Hz PCM, so that invalid encoding uses the file clock.
+     */
+    if (s->codec.tx_rate == 48000 && (s->audio_ctrl1 & 0x3f) == 0 &&
+        ((s->audio_ctrl1 & ~0x0f3f) ||
+         ((s->audio_ctrl1 & 7) != ((s->audio_ctrl1 >> 3) & 7)))) {
+        s->codec.tx_rate = 11025;
+    }
+}
+
+static int tsc210x_dac_enabled(TSC210xState *s)
+{
+    /*
+     * SLAS371D page 2 register 05h. Writing 1 powers a block down.
+     * APD (bit 15) gates the whole codec. DAPD (bit 10) is the stereo
+     * DAC. HAPD (bit 12) is only the headphone amplifier.
+     */
+    return (~s->dac_power & (1 << 15)) && (~s->dac_power & (1 << 10));
+}
+
+static int tsc210x_open_dac(TSC210xState *s)
+{
+    struct audsettings fmt;
+
+    if (s->dac_voice[0]) {
+        return 1;
+    }
+    if (!s->codec.cts || !s->codec.tx_rate) {
+        return 0;
+    }
+
+    fmt.endianness = 0;
+    fmt.nchannels = 2;
+    fmt.freq = s->codec.tx_rate;
+    fmt.fmt = AUDIO_FORMAT_S16;
+
+    s->dac_voice[0] = AUD_open_out(&s->card, s->dac_voice[0],
+                    "tsc2102.sink", s, (void *) tsc210x_audio_out_cb, &fmt);
+    if (!s->dac_voice[0]) {
+        return 0;
+    }
+    AUD_set_active_out(s->dac_voice[0], 1);
+    return 1;
 }
 
 static void tsc2102_audio_output_update(TSC210xState *s)
 {
-    int enable;
-    struct audsettings fmt;
-
     if (s->dac_voice[0]) {
         tsc210x_out_flush(s, s->codec.out.len);
         s->codec.out.size = 0;
@@ -314,24 +371,32 @@ static void tsc2102_audio_output_update(TSC210xState *s)
     }
     s->codec.cts = 0;
 
-    enable =
-            (~s->dac_power & (1 << 15)) &&			/* PWDNC */
-            (~s->dac_power & (1 << 10));			/* DAPWDN */
-    if (!enable || !s->codec.tx_rate)
+    if (!tsc210x_dac_enabled(s) || !s->codec.tx_rate) {
+        s->dac_ready_at = 0;
+        if (s->dac_ready_timer) {
+            timer_del(s->dac_ready_timer);
+        }
         return;
-
-    /* Force our own sampling rate even in slave DAC mode */
-    fmt.endianness = 0;
-    fmt.nchannels = 2;
-    fmt.freq = s->codec.tx_rate;
-    fmt.fmt = AUDIO_FORMAT_S16;
-
-    s->dac_voice[0] = AUD_open_out(&s->card, s->dac_voice[0],
-                    "tsc2102.sink", s, (void *) tsc210x_audio_out_cb, &fmt);
-    if (s->dac_voice[0]) {
-        s->codec.cts = 1;
-        AUD_set_active_out(s->dac_voice[0], 1);
     }
+
+    /*
+     * Nokia's mixer waits about 100 ms after DAPD clears before the
+     * DAC is usable. SLAS371D's VCM note is 500 µs; the N800 qtest
+     * locks the 100 ms window (silent at 50 ms, samples after 110 ms).
+     * The host sink stays closed until the first accepted frame so a
+     * power-up word during boot does not start rate control early.
+     */
+    if (!s->dac_ready_at) {
+        s->dac_ready_at = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                          (100 * NANOSECONDS_PER_SECOND) / 1000;
+    }
+    if (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) < s->dac_ready_at) {
+        if (s->dac_ready_timer) {
+            timer_mod(s->dac_ready_timer, s->dac_ready_at);
+        }
+        return;
+    }
+    s->codec.cts = 1;
 }
 
 static uint16_t tsc2102_data_register_read(TSC210xState *s, int reg)
@@ -462,44 +527,48 @@ static uint16_t tsc2102_control_register_read(
 
 static uint16_t tsc2102_audio_register_read(TSC210xState *s, int reg)
 {
-    int l_ch, r_ch;
-    uint16_t val;
+    int l_ch;
 
     switch (reg) {
     case 0x00:	/* Audio Control 1 */
         return s->audio_ctrl1;
 
-    case 0x01:
-        return 0xff00;
+    case 0x01:	/* ADC volume */
+        return s->adc_volume;
 
     case 0x02:	/* DAC Volume Control */
         return s->volume;
 
-    case 0x03:
-        return 0x8b00;
+    case 0x03:	/* Analog bypass volume */
+        return s->bypass_volume;
 
-    case 0x04:	/* Audio Control 2 */
+    case 0x04:	/* Keyclick. Bit 0 is SSTEP, read-only, default complete. */
         l_ch = 1;
-        r_ch = 1;
         if (s->softstep && !(s->dac_power & (1 << 10))) {
             l_ch = (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >
                             s->volume_change + TSC_SOFTSTEP_DELAY);
-            r_ch = (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >
-                            s->volume_change + TSC_SOFTSTEP_DELAY);
+        }
+        return (s->audio_ctrl2 & ~1u) | (l_ch ? 1u : 0u);
+
+    case 0x05:	/* Audio power. PDSTS (bit 7) is read-only. */
+        {
+            int pdsts = 1;
+
+            /*
+             * RX-34: clearing APD while DAPD stays set completes
+             * inside the driver's 100 ms poll (0xaf00 → 0x2c40).
+             * Clearing DAPD as well still reads PDSTS=0 at 100 ms.
+             */
+            if (!(s->dac_power & (1 << 10)) &&
+                qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) <
+                        s->powerdown + TSC_PDSTS_NS) {
+                pdsts = 0;
+            }
+            return (s->dac_power & ~(1u << 7)) | (pdsts << 7);
         }
 
-        return s->audio_ctrl2 | (l_ch << 3) | (r_ch << 2);
-
-    case 0x05:	/* Stereo DAC Power Control */
-        return 0x2aa0 | s->dac_power |
-                (((s->dac_power & (1 << 10)) &&
-                  (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >
-                   s->powerdown + TSC_POWEROFF_DELAY)) << 6);
-
-    case 0x06:	/* Audio Control 3 */
-        val = s->audio_ctrl3 | 0x0001;
-        s->audio_ctrl3 &= 0xff3f;
-        return val;
+    case 0x06:	/* GPIO */
+        return s->audio_ctrl3;
 
     case 0x07:	/* LCH_BASS_BOOST_N0 */
     case 0x08:	/* LCH_BASS_BOOST_N1 */
@@ -650,7 +719,7 @@ static void tsc2102_audio_register_write(
 {
     switch (reg) {
     case 0x00:	/* Audio Control 1 */
-        s->audio_ctrl1 = value & 0x0f3f;
+        s->audio_ctrl1 = value;
 #ifdef TSC_VERBOSE
         if ((value & ~0x0f3f) || ((value & 7) != ((value >> 3) & 7)))
             fprintf(stderr, "tsc2102_audio_register_write: "
@@ -660,12 +729,8 @@ static void tsc2102_audio_register_write(
         tsc2102_audio_output_update(s);
         return;
 
-    case 0x01:
-#ifdef TSC_VERBOSE
-        if (value != 0xff00)
-            fprintf(stderr, "tsc2102_audio_register_write: "
-                            "wrong value written into reg 0x01\n");
-#endif
+    case 0x01:	/* ADC volume */
+        s->adc_volume = value;
         return;
 
     case 0x02:	/* DAC Volume Control */
@@ -673,12 +738,8 @@ static void tsc2102_audio_register_write(
         s->volume_change = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         return;
 
-    case 0x03:
-#ifdef TSC_VERBOSE
-        if (value != 0x8b00)
-            fprintf(stderr, "tsc2102_audio_register_write: "
-                            "wrong value written into reg 0x03\n");
-#endif
+    case 0x03:	/* Analog bypass volume */
+        s->bypass_volume = value;
         return;
 
     case 0x04:	/* Audio Control 2 */
@@ -690,11 +751,40 @@ static void tsc2102_audio_register_write(
 #endif
         return;
 
-    case 0x05:	/* Stereo DAC Power Control */
-        if ((value & ~s->dac_power) & (1 << 10))
-            s->powerdown = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    case 0x05:	/* Audio power. Drop read-only PDSTS (bit 7) and OTSYN (bit 2). */
+        {
+            uint16_t next = value & 0xff7b;
 
-        s->dac_power = value & 0x9543;
+            /* PDSTS stays clear only across a DAC power-up (DAPD 1→0). */
+            if ((s->dac_power & (1 << 10)) && !(next & (1 << 10))) {
+                s->powerdown = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            } else if (next & (1 << 10)) {
+                s->powerdown = 0;
+            }
+            s->dac_power = next;
+        }
+        {
+            static unsigned pwr_logs;
+            int pwdnc = !!(s->dac_power & (1 << 15));
+            int dapwdn = !!(s->dac_power & (1 << 10));
+
+            /* Transitions matter after the probe burst. Cap stays finite. */
+            if (pwr_logs < 32u || (!pwdnc && !dapwdn && pwr_logs < 48u)) {
+                const char *stat = getenv("N8X0_PCM_STAT");
+                FILE *f;
+
+                pwr_logs++;
+                if (!stat || !stat[0]) {
+                    stat = "/tmp/n8x0-pcm-stat.log";
+                }
+                f = fopen(stat, "a");
+                if (f) {
+                    fprintf(f, "tsc-dac wr=%04x stored=%04x pwdnc=%d dapwdn=%d\n",
+                            value, s->dac_power, pwdnc, dapwdn);
+                    fclose(f);
+                }
+            }
+        }
 #ifdef TSC_VERBOSE
         if ((value & ~0x9543) != 0x2aa0)
             fprintf(stderr, "tsc2102_audio_register_write: "
@@ -704,9 +794,8 @@ static void tsc2102_audio_register_write(
         tsc2102_audio_output_update(s);
         return;
 
-    case 0x06:	/* Audio Control 3 */
-        s->audio_ctrl3 &= 0x00c0;
-        s->audio_ctrl3 |= value & 0xf800;
+    case 0x06:	/* GPIO direction (13:8) and data (5:0) */
+        s->audio_ctrl3 = value & 0x3f3f;
 #ifdef TSC_VERBOSE
         if (value & ~0xf8c7)
             fprintf(stderr, "tsc2102_audio_register_write: "
@@ -973,6 +1062,31 @@ static void tsc210x_i2s_swallow(TSC210xState *s)
         s->codec.out.len = 0;
 }
 
+static int tsc210x_i2s_tx(void *opaque, const uint8_t *pcm, int bytes)
+{
+    TSC210xState *s = opaque;
+    int sent = 0;
+
+    if (!s->codec.cts || !pcm || bytes <= 0) {
+        return 0;
+    }
+    if (!tsc210x_open_dac(s)) {
+        return 0;
+    }
+    while (sent < bytes) {
+        int n = AUD_write(s->dac_voice[0], (void *)(pcm + sent), bytes - sent);
+
+        if (n <= 0) {
+            break;
+        }
+        sent += n;
+    }
+    if (sent > 0) {
+        omap2420_dsp_after_host_audio();
+    }
+    return sent;
+}
+
 static void tsc210x_i2s_set_rate(TSC210xState *s, int in, int out)
 {
     s->i2s_tx_rate = out;
@@ -1044,6 +1158,8 @@ static const VMStateField vmstatefields_tsc210x[] = {
     VMSTATE_UINT16(audio_ctrl3, TSC210xState),
     VMSTATE_UINT16_ARRAY(pll, TSC210xState, 3),
     VMSTATE_UINT16(volume, TSC210xState),
+    VMSTATE_UINT16_V(adc_volume, TSC210xState, 2),
+    VMSTATE_UINT16_V(bypass_volume, TSC210xState, 2),
     VMSTATE_UINT16(dac_power, TSC210xState),
     VMSTATE_INT64(volume_change, TSC210xState),
     VMSTATE_INT64(powerdown, TSC210xState),
@@ -1055,7 +1171,7 @@ static const VMStateField vmstatefields_tsc210x[] = {
 
 static const VMStateDescription vmstate_tsc2102 = {
     .name = "tsc2102",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .pre_save = tsc210x_pre_save,
     .post_load = tsc210x_post_load,
@@ -1064,12 +1180,17 @@ static const VMStateDescription vmstate_tsc2102 = {
 
 static const VMStateDescription vmstate_tsc2301 = {
     .name = "tsc2301",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .pre_save = tsc210x_pre_save,
     .post_load = tsc210x_post_load,
     .fields = vmstatefields_tsc210x,
 };
+
+static void tsc210x_dac_ready(void *opaque)
+{
+    tsc2102_audio_output_update(opaque);
+}
 
 static void tsc210x_init(TSC210xState *s,
                          const char *name,
@@ -1089,11 +1210,13 @@ static void tsc210x_init(TSC210xState *s,
     s->chip.receive = (void *) tsc210x_read;
 
     s->codec.opaque = s;
+    s->codec.tx = tsc210x_i2s_tx;
     s->codec.tx_swallow = (void *) tsc210x_i2s_swallow;
     s->codec.set_rate = (void *) tsc210x_i2s_set_rate;
     s->codec.in.fifo = s->in_fifo;
     s->codec.out.fifo = s->out_fifo;
 
+    s->dac_ready_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, tsc210x_dac_ready, s);
     tsc210x_reset(s);
 
     qemu_add_mouse_event_handler(tsc210x_touchscreen_event, s, 1, name);

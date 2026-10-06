@@ -155,7 +155,7 @@ static uint64_t omap_mcspi_read(void *opaque, hwaddr addr, unsigned size)
 
     switch (addr) {
     case 0x00:	/* MCSPI_REVISION */
-        return 0x91;
+        return 0x14;	/* OMAP2420 MCSPI_REVISION, RX-34 */
 
     case 0x10:	/* MCSPI_SYSCONFIG */
         return s->sysconfig;
@@ -310,8 +310,6 @@ static void omap_mcspi_write(void *opaque, hwaddr addr,
     case 0x40: ch ++;
         /* fall through */
     case 0x2c:	/* MCSPI_CHCONF */
-        if ((value ^ s->ch[ch].config) & (3 << 14))	/* DMAR | DMAW */
-            omap_mcspi_dmarequest_update(s->ch + ch);
         if (((value >> 12) & 3) == 3) { /* TRM */
             qemu_log_mask(LOG_GUEST_ERROR, "%s: invalid TRM value (3)\n",
                           __func__);
@@ -325,7 +323,21 @@ static void omap_mcspi_write(void *opaque, hwaddr addr,
             s->ch[ch].setcs) {
             s->ch[ch].setcs(s->ch[ch].opaque, !!(value & (1 << 20)));
         }
-        s->ch[ch].config = value & 0x7fffff;
+        /*
+         * Store CHCONF before refreshing DRQs. omap2_mcspi enables DMAW/DMAR
+         * only after omap_start_dma(), while TXS is already set. Updating
+         * the request from the old config drops that rising edge, the
+         * element-synced channel never runs, and cx3110x's spi_sync of
+         * 3826.arm waits forever (connectivity UI frozen).
+         */
+        {
+            uint32_t old = s->ch[ch].config;
+
+            s->ch[ch].config = value & 0x7fffff;
+            if ((s->ch[ch].config ^ old) & (3 << 14)) { /* DMAR | DMAW */
+                omap_mcspi_dmarequest_update(s->ch + ch);
+            }
+        }
         break;
 
     case 0x70: ch ++;

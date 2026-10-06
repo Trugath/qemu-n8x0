@@ -22,6 +22,7 @@
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
 #include "hw/arm/omap.h"
+#include "hw/core/cpu.h"
 #include "hw/sysbus.h"
 #include "qemu/error-report.h"
 #include "qemu/module.h"
@@ -37,6 +38,13 @@ struct omap_intr_handler_bank_s {
     uint32_t swi;
     unsigned char priority[32];
 };
+
+static bool omap2_mail_edge_suppress;
+/* One delivery: line 26 wins even when a higher index shares its priority. */
+static int omap2_prefer_mail26;
+static int omap2_mail_watch;
+static unsigned omap2_mail_sir_logs;
+static void omap2_pcm_stat(const char *line);
 
 struct OMAPIntcState {
     SysBusDevice parent_obj;
@@ -66,6 +74,16 @@ static void omap_inth_sir_update(OMAPIntcState *s, int is_fiq)
     uint32_t level;
     sir_intr = 0;
     p_intr = 255;
+
+    if (!is_fiq && omap2_prefer_mail26) {
+        uint32_t mail = 1u << 26;
+
+        omap2_prefer_mail26 = 0;
+        if (s->bank[0].irqs & ~s->bank[0].mask & ~s->bank[0].fiq & mail) {
+            s->sir_intr[0] = 26;
+            return;
+        }
+    }
 
     /* Find the interrupt line with the highest dynamic priority.
      * Note: 0 denotes the highest priority.
@@ -145,12 +163,28 @@ static void omap_set_intr_noedge(void *opaque, int irq, int req)
     if (req) {
         rise = ~bank->inputs & (1 << n);
         if (rise) {
+            CPUState *cs = first_cpu;
+
             bank->irqs |= bank->inputs |= rise;
+            /*
+             * A level line that rises while NEWIRQAGR is still clear is
+             * latched in ITR but omap_inth_update will not raise the CPU
+             * line. If the CPU has already left the previous ISR and is
+             * halted, nothing writes NEWIRQAGR and the latch sits there.
+             * esd's pcm read is that halt: FIFO1 NEWMSG is high and the
+             * read never returns. Re-arm agreement only in that idle case.
+             */
+            if (ih->new_agr[0] == 0 && cs && cs->halted &&
+                !omap2_mail_edge_suppress) {
+                qemu_set_irq(ih->parent_intr[0], 0);
+                ih->new_agr[0] = ~0;
+            }
             omap_inth_update(ih, 0);
             omap_inth_update(ih, 1);
         }
-    } else
+    } else {
         bank->irqs = (bank->inputs &= ~(1 << n)) | bank->swi;
+    }
 }
 
 static uint64_t omap_inth_read(void *opaque, hwaddr addr,
@@ -450,6 +484,14 @@ static uint64_t omap2_inth_read(void *opaque, hwaddr addr,
         return 1;						/* RESETDONE */
 
     case 0x40:	/* INTC_SIR_IRQ */
+        if (omap2_mail_watch && s->sir_intr[0] == 26 &&
+            omap2_mail_sir_logs < 8) {
+            char line[64];
+
+            omap2_mail_sir_logs++;
+            snprintf(line, sizeof(line), "pcm1-sir-read sir=26\n");
+            omap2_pcm_stat(line);
+        }
         return s->sir_intr[0];
 
     case 0x44:	/* INTC_SIR_FIQ */
@@ -619,11 +661,169 @@ static const MemoryRegionOps omap2_inth_mem_ops = {
     },
 };
 
+static OMAPIntcState *omap2_mpu_intc;
+
+static void omap2_pcm_stat(const char *line)
+{
+    const char *stat = getenv("N8X0_PCM_STAT");
+    FILE *f;
+
+    if (!stat || !stat[0]) {
+        stat = "/tmp/n8x0-pcm-stat.log";
+    }
+    f = fopen(stat, "a");
+    if (!f) {
+        return;
+    }
+    fputs(line, f);
+    fclose(f);
+}
+
+void omap2_intc_deliver_stuck_mail(void)
+{
+    OMAPIntcState *s = omap2_mpu_intc;
+    struct omap_intr_handler_bank_s *bank;
+    uint32_t bit = 1u << 26;
+    static unsigned logs;
+
+    if (!s) {
+        return;
+    }
+    bank = &s->bank[0];
+    /*
+     * FIFO1 still holds the word. The in-ISR re-arm can leave line 26
+     * latched and then masked, so a later slice sees no deliverable
+     * IRQ and the pcm1 read never returns. Put the latch back and
+     * clear only this line's mask.
+     */
+    if (bank->inputs & bit) {
+        bank->irqs |= bit;
+    }
+    if ((bank->irqs & bit) == 0) {
+        return;
+    }
+    bank->mask &= ~bit;
+    bank->fiq &= ~bit;
+    /*
+     * The cmd 2 word is still in FIFO1, but NEWIRQAGR already ran and
+     * left the CPU line low. Equal priorities pick the highest index,
+     * so a stuck line above 26 steals the raise and the read never
+     * pops. This one delivery is MAIL_U0.
+     */
+    omap2_prefer_mail26 = 1;
+    omap2_mail_watch = 1;
+    qemu_set_irq(s->parent_intr[0], 0);
+    s->new_agr[0] = ~0;
+    omap_inth_update(s, 0);
+    if (logs < 8) {
+        char line[64];
+
+        logs++;
+        snprintf(line, sizeof(line),
+                 "pcm1-wfi-deliver mail26 agr=%08x sir=%d\n",
+                 s->new_agr[0], s->sir_intr[0]);
+        omap2_pcm_stat(line);
+    }
+}
+
+int omap2_intc_rearm_halted_mail(void)
+{
+    OMAPIntcState *s = omap2_mpu_intc;
+    struct omap_intr_handler_bank_s *bank;
+    uint32_t bit = 1u << 26;
+    static unsigned logs;
+
+    if (!s || s->new_agr[0] != 0) {
+        return 0;
+    }
+    bank = &s->bank[0];
+    if ((bank->irqs & ~bank->mask & ~bank->fiq & bit) == 0) {
+        return 0;
+    }
+    /*
+     * The cmd 2 rise is latched in ITR while the CPU is still running,
+     * so the idle check in omap_set_intr_noedge does not re-arm. The
+     * read then waits. Re-arm only this mailbox line, once the CPU
+     * actually halts.
+     */
+    qemu_set_irq(s->parent_intr[0], 0);
+    s->new_agr[0] = ~0;
+    omap_inth_update(s, 0);
+    if (logs < 8) {
+        logs++;
+        omap2_pcm_stat("pcm1-cmd2-rearm mail26\n");
+    }
+    return 1;
+}
+
+void omap2_intc_mpu_snapshot(uint32_t *itr, uint32_t *mir, uint32_t *agr,
+                             int *sir, int *halted)
+{
+    CPUState *cs = first_cpu;
+
+    *halted = cs && cs->halted;
+    if (!omap2_mpu_intc) {
+        *itr = 0;
+        *mir = 0;
+        *agr = 0;
+        *sir = 0;
+        return;
+    }
+    *itr = omap2_mpu_intc->bank[0].irqs;
+    *mir = omap2_mpu_intc->bank[0].mask;
+    *agr = omap2_mpu_intc->new_agr[0];
+    *sir = omap2_mpu_intc->sir_intr[0];
+}
+
+static bool omap2_intc_get_suppress(Object *obj, Error **errp)
+{
+    return omap2_mail_edge_suppress;
+}
+
+static void omap2_intc_set_suppress(Object *obj, bool value, Error **errp)
+{
+    omap2_mail_edge_suppress = value;
+}
+
+static bool omap2_intc_get_rearm(Object *obj, Error **errp)
+{
+    return false;
+}
+
+static void omap2_intc_set_rearm(Object *obj, bool value, Error **errp)
+{
+    if (value) {
+        omap2_intc_rearm_halted_mail();
+    }
+}
+
+static bool omap2_intc_get_prefer(Object *obj, Error **errp)
+{
+    return false;
+}
+
+static void omap2_intc_set_prefer(Object *obj, bool value, Error **errp)
+{
+    if (value) {
+        omap2_intc_deliver_stuck_mail();
+    }
+}
+
 static void omap2_intc_init(Object *obj)
 {
     DeviceState *dev = DEVICE(obj);
     OMAPIntcState *s = OMAP_INTC(obj);
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
+
+    omap2_mpu_intc = s;
+    object_property_add_child(object_get_root(), "omap2-mpu-intc", obj);
+    object_property_add_bool(obj, "x-suppress-mail-edge-rearm",
+                             omap2_intc_get_suppress,
+                             omap2_intc_set_suppress);
+    object_property_add_bool(obj, "x-mail-wfi-rearm",
+                             omap2_intc_get_rearm, omap2_intc_set_rearm);
+    object_property_add_bool(obj, "x-mail-prefer-26",
+                             omap2_intc_get_prefer, omap2_intc_set_prefer);
 
     s->level_only = 1;
     s->nbanks = 3;

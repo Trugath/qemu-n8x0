@@ -25,6 +25,9 @@ void cbus_attach(CBus *bus, void *slave_opaque);
 
 void *retu_init(qemu_irq irq, int vilma);
 void *tahvo_init(qemu_irq irq, int betty);
+/* RX-34 idle captured by n8x0-hwtest (goldens/rx34, 2026-09-23). */
+void retu_apply_rx34_idle(void *retu);
+void tahvo_apply_rx34_idle(void *tahvo);
 
 void retu_key_event(void *retu, int state);
 
